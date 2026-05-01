@@ -24,6 +24,12 @@ from chessvec.vectorized import (
     legal_action_mask,
 )
 
+try:
+    from chessvec.triton_step import _HAS_TRITON, triton_step
+except ImportError:  # pragma: no cover
+    _HAS_TRITON = False
+    triton_step = None  # type: ignore[assignment]
+
 def _sync(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -110,6 +116,40 @@ def bench_vectorized(
     return time.perf_counter() - t0, sync_overhead
 
 
+def bench_triton(
+    state: State, batch_size: int, n_steps: int, device: torch.device
+) -> tuple[float, float]:
+    """Same as bench_vectorized but uses the single-kernel Triton step.
+
+    Mask + sampling still uses the PyTorch path — only the state-transition
+    `apply_action` is replaced by `triton_step`.
+    """
+    assert triton_step is not None
+    vs = from_states([state] * batch_size, device=device)
+    initial = vs.clone()
+
+    _sync(device)
+    t0 = time.perf_counter()
+    for _ in range(n_steps):
+        mask = legal_action_mask(vs)
+        any_legal = mask.any(dim=1)
+        if not bool(any_legal.all()):
+            idx = (~any_legal).nonzero(as_tuple=True)[0]
+            vs.pieces[idx] = initial.pieces[idx]
+            vs.side_to_move[idx] = initial.side_to_move[idx]
+            vs.castling[idx] = initial.castling[idx]
+            vs.en_passant[idx] = initial.en_passant[idx]
+            vs.halfmove_clock[idx] = initial.halfmove_clock[idx]
+            vs.fullmove_number[idx] = initial.fullmove_number[idx]
+            mask = legal_action_mask(vs)
+        action = torch.multinomial(mask.float(), num_samples=1).squeeze(1)
+        vs = triton_step(vs, action)
+    sync_t0 = time.perf_counter()
+    _sync(device)
+    sync_overhead = time.perf_counter() - sync_t0
+    return time.perf_counter() - t0, sync_overhead
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -182,6 +222,16 @@ def main() -> None:
                 tag = f"vec[{device.type}] B={B}"
                 extra = f" (sync {sync * 1000:.1f}ms)" if sync else ""
                 print(f"{name:<14} {tag:<22} {sps:>14,.0f} {elapsed:>10.3f}{extra}")
+
+                if _HAS_TRITON and device.type == "cuda":
+                    bench_triton(state, batch_size=B, n_steps=4, device=device)  # warmup
+                    elapsed, sync = bench_triton(
+                        state, batch_size=B, n_steps=args.vec_steps, device=device
+                    )
+                    sps = (B * args.vec_steps) / elapsed
+                    tag = f"triton[{device.type}] B={B}"
+                    extra = f" (sync {sync * 1000:.1f}ms)" if sync else ""
+                    print(f"{name:<14} {tag:<22} {sps:>14,.0f} {elapsed:>10.3f}{extra}")
         print()
 
 
