@@ -23,6 +23,14 @@ dev = [
     "python-chess>=1.10",
 ]
 
+[tool.uv.sources]
+torch = { index = "pytorch", marker = "sys_platform != 'darwin'" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/chessvec"]
 
