@@ -380,6 +380,11 @@ def _build_plane_geometry() -> dict[str, Tensor]:
 
 _PLANE_GEOM = _build_plane_geometry()
 
+# Castle plane indices in the 73-plane layout. Queen-like planes are laid out
+# as dir_idx * 7 + (dist - 1). E = dir 2, W = dir 6, dist = 2.
+_PLANE_CASTLE_E = 2 * 7 + 1  # 15
+_PLANE_CASTLE_W = 6 * 7 + 1  # 43
+
 
 def _plane_geom_on(device: torch.device) -> dict[str, Tensor]:
     return {k: v.to(device) for k, v in _PLANE_GEOM.items()}
@@ -388,6 +393,22 @@ def _plane_geom_on(device: torch.device) -> dict[str, Tensor]:
 # ---------------------------------------------------------------------------
 # Pseudo-legal mask generation.
 # ---------------------------------------------------------------------------
+
+
+def _move_rook_branchless(
+    pieces: Tensor, mask: Tensor, src_sq: Tensor, dst_sq: Tensor
+) -> None:
+    """Where mask[i] is true, move pieces[i, src_sq[i]] to pieces[i, dst_sq[i]],
+    zeroing the source. No-op (but still touches both squares) elsewhere.
+    src_sq / dst_sq must be valid indices for every row regardless of mask
+    (callers pass rank-derived squares that are always in [0, 63]).
+    """
+    src = src_sq.view(-1, 1)
+    dst = dst_sq.view(-1, 1)
+    src_val = pieces.gather(1, src).squeeze(1)
+    cur_dst = pieces.gather(1, dst).squeeze(1)
+    pieces.scatter_(1, src, torch.where(mask, torch.zeros_like(src_val), src_val).view(-1, 1))
+    pieces.scatter_(1, dst, torch.where(mask, src_val, cur_dst).view(-1, 1))
 
 
 def _gather_to_pieces(pieces: Tensor, to_sq: Tensor) -> Tensor:
@@ -798,21 +819,11 @@ def pseudo_legal_mask(vs: VState) -> Tensor:
     )
 
     # Place these flags into the (from_sq, plane) action slots.
-    # E-castle for white: from=e1, plane=castle_E_plane_idx.
-    plane_castle_E = (
-        (torch.tensor(_QUEEN_SHIFTS, device=device)[:, 0] == 1)
-        & (torch.tensor(_QUEEN_SHIFTS, device=device)[:, 1] == 0)
-    ).nonzero()[0].item() * 7 + 1
-    plane_castle_W = (
-        (torch.tensor(_QUEEN_SHIFTS, device=device)[:, 0] == -1)
-        & (torch.tensor(_QUEEN_SHIFTS, device=device)[:, 1] == 0)
-    ).nonzero()[0].item() * 7 + 1
-
     castle_mask = torch.zeros(B, 64, 73, dtype=torch.bool, device=device)
-    castle_mask[:, e1, plane_castle_E] = castle_wk_ok
-    castle_mask[:, e1, plane_castle_W] = castle_wq_ok
-    castle_mask[:, e8, plane_castle_E] = castle_bk_ok
-    castle_mask[:, e8, plane_castle_W] = castle_bq_ok
+    castle_mask[:, e1, _PLANE_CASTLE_E] = castle_wk_ok
+    castle_mask[:, e1, _PLANE_CASTLE_W] = castle_wq_ok
+    castle_mask[:, e8, _PLANE_CASTLE_E] = castle_bk_ok
+    castle_mask[:, e8, _PLANE_CASTLE_W] = castle_bq_ok
     base = base | castle_mask
 
     return base
@@ -930,21 +941,9 @@ def legal_action_mask(vs: VState) -> Tensor:
     castle_kingside = is_castle & (df_n == 2)
     castle_queenside = is_castle & (df_n == -2)
     rank_n = from_sq >> 3
-    # Kingside: rook from h to f (file 7 -> 5).
-    rook_from_ks = rank_n * 8 + 7
-    rook_to_ks = rank_n * 8 + 5
-    rook_from_qs = rank_n * 8 + 0
-    rook_to_qs = rank_n * 8 + 3
-    if castle_kingside.any():
-        idx = castle_kingside.nonzero(as_tuple=True)[0]
-        rook_piece = post_pieces[idx, rook_from_ks[idx]]
-        post_pieces[idx, rook_from_ks[idx]] = 0
-        post_pieces[idx, rook_to_ks[idx]] = rook_piece
-    if castle_queenside.any():
-        idx = castle_queenside.nonzero(as_tuple=True)[0]
-        rook_piece = post_pieces[idx, rook_from_qs[idx]]
-        post_pieces[idx, rook_from_qs[idx]] = 0
-        post_pieces[idx, rook_to_qs[idx]] = rook_piece
+    # Kingside: rook from h to f (file 7 -> 5). Queenside: a -> d.
+    _move_rook_branchless(post_pieces, castle_kingside, rank_n * 8 + 7, rank_n * 8 + 5)
+    _move_rook_branchless(post_pieces, castle_queenside, rank_n * 8 + 0, rank_n * 8 + 3)
 
     # Now, for each post-move position, check whether mover's king is attacked
     # by the *opponent*. We compute attacks-by-(1 - mover) on these N states.
@@ -1020,15 +1019,16 @@ def apply_action(vs: VState, action: Tensor) -> VState:
     is_pawn = pt == 1
     is_king = pt == 6
 
-    # En passant capture.
+    # En passant capture. Update branchlessly to avoid a CPU sync on .any().
     is_ep_capture = is_pawn & (to_sq == ep) & (captured_piece == 0) & (ep >= 0)
-    ep_capture_sq = torch.where(side == WHITE, to_sq - 8, to_sq + 8)
-    if is_ep_capture.any():
-        idx = is_ep_capture.nonzero(as_tuple=True)[0]
-        # Track the en-passant capture as a "capture" for the halfmove clock.
-        captured_piece = captured_piece.clone()
-        captured_piece[idx] = pieces[idx, ep_capture_sq[idx]]
-        pieces[idx, ep_capture_sq[idx]] = 0
+    ep_capture_sq = torch.where(side == WHITE, to_sq - 8, to_sq + 8).clamp(0, 63)
+    ep_pawn = pieces.gather(1, ep_capture_sq.view(B, 1)).squeeze(1)
+    captured_piece = torch.where(is_ep_capture, ep_pawn, captured_piece)
+    pieces.scatter_(
+        1,
+        ep_capture_sq.view(B, 1),
+        torch.where(is_ep_capture, torch.zeros_like(ep_pawn), ep_pawn).view(B, 1),
+    )
 
     # Move piece.
     pieces[arange_b, from_sq] = 0
@@ -1051,18 +1051,8 @@ def apply_action(vs: VState, action: Tensor) -> VState:
     castle_ks = is_castle & (df_n == 2)
     castle_qs = is_castle & (df_n == -2)
     rank_b = from_sq >> 3
-    if castle_ks.any():
-        idx = castle_ks.nonzero(as_tuple=True)[0]
-        rk = rank_b[idx]
-        rook = pieces[idx, rk * 8 + 7]
-        pieces[idx, rk * 8 + 7] = 0
-        pieces[idx, rk * 8 + 5] = rook
-    if castle_qs.any():
-        idx = castle_qs.nonzero(as_tuple=True)[0]
-        rk = rank_b[idx]
-        rook = pieces[idx, rk * 8 + 0]
-        pieces[idx, rk * 8 + 0] = 0
-        pieces[idx, rk * 8 + 3] = rook
+    _move_rook_branchless(pieces, castle_ks, rank_b * 8 + 7, rank_b * 8 + 5)
+    _move_rook_branchless(pieces, castle_qs, rank_b * 8 + 0, rank_b * 8 + 3)
 
     # Update castling rights.
     # King move clears both rights for that side.
