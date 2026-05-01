@@ -30,6 +30,23 @@ except ImportError:  # pragma: no cover
     _HAS_TRITON = False
     triton_step = None  # type: ignore[assignment]
 
+def _branchless_reset(vs, initial, need_reset):
+    """Return a VState where rows with `need_reset` are replaced by `initial`.
+    Branchless (always copies) so there is no per-iteration host sync.
+    """
+    from chessvec.vectorized import VState
+
+    m1 = need_reset
+    return VState(
+        pieces=torch.where(m1.unsqueeze(1), initial.pieces, vs.pieces),
+        side_to_move=torch.where(m1, initial.side_to_move, vs.side_to_move),
+        castling=torch.where(m1, initial.castling, vs.castling),
+        en_passant=torch.where(m1, initial.en_passant, vs.en_passant),
+        halfmove_clock=torch.where(m1, initial.halfmove_clock, vs.halfmove_clock),
+        fullmove_number=torch.where(m1, initial.fullmove_number, vs.fullmove_number),
+    )
+
+
 def _sync(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -91,23 +108,17 @@ def bench_vectorized(
     # on accelerators we fall back to the global RNG (good enough for timing).
     rng = torch.Generator(device="cpu").manual_seed(0) if device.type == "cpu" else None
     initial = vs.clone()
+    initial_mask = legal_action_mask(initial)  # precomputed once; no per-iter sync
 
     _sync(device)
     t0 = time.perf_counter()
     for _ in range(n_steps):
         mask = legal_action_mask(vs)
-        # Reset terminal envs back to the initial state before sampling, so
-        # every row of `mask` we sample from has at least one legal action.
-        any_legal = mask.any(dim=1)
-        if not bool(any_legal.all()):
-            idx = (~any_legal).nonzero(as_tuple=True)[0]
-            vs.pieces[idx] = initial.pieces[idx]
-            vs.side_to_move[idx] = initial.side_to_move[idx]
-            vs.castling[idx] = initial.castling[idx]
-            vs.en_passant[idx] = initial.en_passant[idx]
-            vs.halfmove_clock[idx] = initial.halfmove_clock[idx]
-            vs.fullmove_number[idx] = initial.fullmove_number[idx]
-            mask = legal_action_mask(vs)
+        # Reset terminal envs back to the initial state branchlessly: any row
+        # without a legal move adopts `initial`'s state and mask. No host sync.
+        need_reset = ~mask.any(dim=1)
+        vs = _branchless_reset(vs, initial, need_reset)
+        mask = torch.where(need_reset.view(batch_size, 1), initial_mask, mask)
         action = torch.multinomial(mask.float(), num_samples=1, generator=rng).squeeze(1)
         vs = apply_action(vs, action)
     sync_t0 = time.perf_counter()
@@ -127,21 +138,15 @@ def bench_triton(
     assert triton_step is not None
     vs = from_states([state] * batch_size, device=device)
     initial = vs.clone()
+    initial_mask = legal_action_mask(initial)
 
     _sync(device)
     t0 = time.perf_counter()
     for _ in range(n_steps):
         mask = legal_action_mask(vs)
-        any_legal = mask.any(dim=1)
-        if not bool(any_legal.all()):
-            idx = (~any_legal).nonzero(as_tuple=True)[0]
-            vs.pieces[idx] = initial.pieces[idx]
-            vs.side_to_move[idx] = initial.side_to_move[idx]
-            vs.castling[idx] = initial.castling[idx]
-            vs.en_passant[idx] = initial.en_passant[idx]
-            vs.halfmove_clock[idx] = initial.halfmove_clock[idx]
-            vs.fullmove_number[idx] = initial.fullmove_number[idx]
-            mask = legal_action_mask(vs)
+        need_reset = ~mask.any(dim=1)
+        vs = _branchless_reset(vs, initial, need_reset)
+        mask = torch.where(need_reset.view(batch_size, 1), initial_mask, mask)
         action = torch.multinomial(mask.float(), num_samples=1).squeeze(1)
         vs = triton_step(vs, action)
     sync_t0 = time.perf_counter()

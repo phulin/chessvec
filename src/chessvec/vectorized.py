@@ -855,25 +855,48 @@ def legal_action_mask(vs: VState) -> Tensor:
     B = vs.batch_size
     pseudo = pseudo_legal_mask(vs)  # [B, 64, 73]
 
-    # Find candidate (env, from, plane) triples.
-    env_idx, from_sq, plane = pseudo.nonzero(as_tuple=True)
-    N = env_idx.numel()
-    if N == 0:
-        return torch.zeros(B, ACTION_SIZE, dtype=torch.bool, device=device)
+    # Compact pseudo into a fixed-size [B, K] action-id buffer with sentinel
+    # entries for unused slots. K = 256 is a safe upper bound on pseudo-legal
+    # moves per chess position. Using a fixed K (rather than nonzero, whose
+    # output shape is data-dependent) eliminates a host sync on accelerators.
+    K = 256
+    flat_pseudo = pseudo.view(B, ACTION_SIZE)  # [B, ACTION_SIZE]
+    # 0-indexed write position within the row (cumsum is 1-indexed for True).
+    pos = flat_pseudo.long().cumsum(dim=1) - 1
+    action_src = (
+        torch.arange(ACTION_SIZE, device=device, dtype=torch.long).view(1, -1).expand(B, -1)
+    )
+    write_pos = torch.where(
+        flat_pseudo,
+        pos.clamp(min=0, max=K),
+        torch.full_like(pos, K),  # invalid slots route to sentinel column K
+    )
+    compact_buf = torch.full((B, K + 1), -1, dtype=torch.long, device=device)
+    compact_buf.scatter_(1, write_pos, action_src)
+    compact = compact_buf[:, :K]  # [B, K]; -1 marks unused slots
+    valid = compact >= 0  # [B, K]
+
+    N = B * K
+    env_idx = torch.arange(B, device=device).view(B, 1).expand(B, K).reshape(N)
+    action_n = compact.clamp(min=0).reshape(N)
+    valid_n = valid.reshape(N)
 
     pieces = vs.pieces.long()  # [B, 64]
     side = vs.side_to_move.long()  # [B]
     mover_color = side[env_idx]  # [N]
 
     geom = _plane_geom_on(device)
-    # Compute real to_sq for each candidate using mover-frame dr.
+    from_sq = action_n // NUM_MOVE_PLANES  # [N]
+    plane = action_n % NUM_MOVE_PLANES  # [N]
     df_n = geom["df"][from_sq, plane]
     dr_n = geom["dr"][from_sq, plane]
     dr_signed = torch.where(mover_color == WHITE, dr_n, -dr_n)
     f0 = from_sq & 7
     r0 = from_sq >> 3
-    f1 = f0 + df_n
-    r1 = r0 + dr_signed
+    # Clamp into the board so that bogus (invalid) slots produce safe indices;
+    # results for those slots are masked off via `valid_n` at the end.
+    f1 = (f0 + df_n).clamp(0, 7)
+    r1 = (r0 + dr_signed).clamp(0, 7)
     to_sq = r1 * 8 + f1  # [N]
 
     moving_piece = pieces[env_idx, from_sq]  # [N]
@@ -893,14 +916,13 @@ def legal_action_mask(vs: VState) -> Tensor:
     ep_target_n = vs.en_passant.long()[env_idx]
     is_pawn_n = pt_n == 1
     is_ep_capture = is_pawn_n & (to_sq == ep_target_n) & (captured_piece == 0)
-    # Remove the pawn captured en passant (one rank "behind" to_sq from mover POV).
-    ep_capture_sq = torch.where(
-        mover_color == WHITE,
-        to_sq - 8,
-        to_sq + 8,
+    ep_capture_sq = torch.where(mover_color == WHITE, to_sq - 8, to_sq + 8).clamp(0, 63)
+    ep_pawn = post_pieces.gather(1, ep_capture_sq.view(N, 1)).squeeze(1)
+    post_pieces.scatter_(
+        1,
+        ep_capture_sq.view(N, 1),
+        torch.where(is_ep_capture, torch.zeros_like(ep_pawn), ep_pawn).view(N, 1),
     )
-    # Always a safe index (since ep_target is a rank-3 or rank-6 square).
-    post_pieces[is_ep_capture.nonzero(as_tuple=True)[0], ep_capture_sq[is_ep_capture]] = 0
 
     # Move the piece: clear from_sq, set to_sq.
     post_pieces[arange_n, from_sq] = 0
@@ -973,13 +995,14 @@ def legal_action_mask(vs: VState) -> Tensor:
         attacks_by_white,
     )  # [N, 64]
     king_in_check = opp_attacks.gather(1, king_sq.view(N, 1)).squeeze(1)  # [N]
-    legal = ~king_in_check
+    legal = valid_n & ~king_in_check  # invalid slots are not legal
 
-    # Scatter results back to [B, ACTION_SIZE].
-    out = torch.zeros(B, ACTION_SIZE, dtype=torch.bool, device=device)
-    action_idx = from_sq * NUM_MOVE_PLANES + plane
-    out[env_idx[legal], action_idx[legal]] = True
-    return out
+    # Scatter results back to [B, ACTION_SIZE]. Route invalid slots' writes
+    # to a dummy column (ACTION_SIZE) so they cannot clobber action 0.
+    write_action = torch.where(valid, compact, torch.full_like(compact, ACTION_SIZE))
+    out_buf = torch.zeros(B, ACTION_SIZE + 1, dtype=torch.bool, device=device)
+    out_buf.scatter_(1, write_action, legal.view(B, K))
+    return out_buf[:, :ACTION_SIZE]
 
 
 # ---------------------------------------------------------------------------
