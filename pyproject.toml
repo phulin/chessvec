@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chessvec"
+version = "0.1.0"
+description = "Reference and vectorized chess rules engines."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-xdist>=3",
+    "ruff>=0.6",
+    "ty>=0.0.1a5",
+    "pre-commit>=3.7",
+    "python-chess>=1.10",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chessvec"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle / pyflakes
+    "I",             # isort
+    "UP",            # pyupgrade
+    "B",             # bugbear
+    "SIM",           # simplify
+    "RUF",           # ruff-specific
+    "N",             # naming
+    "PERF",          # perflint
+]
+ignore = [
+    "E501",   # line length handled by formatter
+    "N803",   # allow upper-case args (B for batch dim)
+    "N806",   # allow upper-case locals
+    "N812",   # `import torch.nn.functional as F` is a common convention
+    "SIM102", # nested if-statements often improve readability for castling-style rules
+    "SIM109", # explicit `==` chains can be clearer than `in (a, b)` for hot paths
+    "PERF401",  # list.extend over append-loops not always clearer
+    "B007",   # unused loop variables are sometimes intentional for parity with parallel structures
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ty.src]
+include = ["src", "tests"]
+
+[tool.ty.rules]
+# torch is an optional runtime dependency; suppress import-resolution noise
+# so type-checking still passes in environments without torch installed.
+unresolved-import = "ignore"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
