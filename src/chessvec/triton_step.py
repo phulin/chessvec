@@ -465,6 +465,33 @@ def _legal_tables_on(device: torch.device) -> dict[str, Tensor]:
     wpawn_tbl = _WPAWN_ATTACK.to(device=device, dtype=torch.int32).contiguous()
     bpawn_tbl = _BPAWN_ATTACK.to(device=device, dtype=torch.int32).contiguous()
 
+    # ----- Per-(from_sq, plane) "between" bitboards -----
+    # bit `s` set iff square `s` is strictly between `from_sq` and the plane's
+    # to-square along the plane's board-frame direction. 0 for non-queen-like
+    # planes and dist <= 1 (no intermediate squares).
+    # Two tables: one per side (white uses (df, dr); black uses (df, -dr)).
+    import numpy as np
+    QUEEN_SHIFTS = [(0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1)]
+    bb_np = np.zeros((2, 64, PAD), dtype=np.uint64)
+    for is_black in (0, 1):
+        for from_sq in range(64):
+            f0, r0 = from_sq & 7, from_sq >> 3
+            for d_idx, (qdf, qdr) in enumerate(QUEEN_SHIFTS):
+                qdr_b = -qdr if is_black else qdr
+                for dist in range(1, 8):
+                    plane = d_idx * 7 + (dist - 1)
+                    bits = 0
+                    for k in range(1, dist):
+                        f = f0 + qdf * k
+                        r = r0 + qdr_b * k
+                        if 0 <= f < 8 and 0 <= r < 8:
+                            bits |= 1 << (r * 8 + f)
+                    bb_np[is_black, from_sq, plane] = bits
+    # Reinterpret uint64 -> int64 to put it in a torch int64 tensor (bit
+    # patterns identical; bit 63 squares show up as negative values, which is
+    # fine since we only use bitwise ops on these tensors in the kernel).
+    between_bb = torch.from_numpy(bb_np.view(np.int64).copy()).to(device=device).contiguous()
+
     cached = {
         "df": df,
         "dr": dr,
@@ -476,6 +503,7 @@ def _legal_tables_on(device: torch.device) -> dict[str, Tensor]:
         "king": king_tbl,
         "wpawn": wpawn_tbl,
         "bpawn": bpawn_tbl,
+        "between_bb": between_bb,
     }
     _LEGAL_TABLES_CACHE[device] = cached
     return cached
@@ -500,6 +528,7 @@ if _HAS_TRITON:
         KING_TBL_ptr,
         WPAWN_TBL_ptr,
         BPAWN_TBL_ptr,
+        BETWEEN_BB_ptr,    # int64 [2, 64, PAD]  (white, black)
         BLOCK_SQ: tl.constexpr,    # 64
         BLOCK_PL: tl.constexpr,    # 128 (PAD)
         NUM_PL: tl.constexpr,      # 73
@@ -831,25 +860,16 @@ if _HAS_TRITON:
             | (is_king_p & king_q_ok)
         )
 
-        # ---- Slider intermediate-blocker test ----
-        # For queen-like planes with dist >= 2: any of squares 1..dist-1 along
-        # board-frame direction occupied?
-        df_unit = tl.where(df > 0, 1, tl.where(df < 0, -1, 0))
-        dr_unit_mover = tl.where(dr > 0, 1, tl.where(dr < 0, -1, 0))
-        dr_unit = tl.where(is_white_mover, dr_unit_mover, -dr_unit_mover)
-
-        has_intermediate = tl.zeros([BLOCK_SQ, BLOCK_PL], tl.int32)
-        for step in tl.static_range(1, 7):  # 1..6 covers dist-1 up to 6
-            # in segment iff step <= ray_dist - 1 (i.e., strictly before to_sq).
-            in_seg = (is_q & (ray_dist >= 2) & (step <= ray_dist - 1))
-            tf2 = rfile_from + df_unit * step
-            tr2 = rrank_from + dr_unit * step
-            on_b2 = (tf2 >= 0) & (tf2 < 8) & (tr2 >= 0) & (tr2 < 8)
-            tsq2 = tl.where(on_b2, tr2 * 8 + tf2, 0)
-            tp2 = tl.gather(pieces, tsq2.reshape([BLOCK_SQ * BLOCK_PL]), axis=0).reshape([BLOCK_SQ, BLOCK_PL])
-            tp2 = tl.where(on_b2, tp2, 0)
-            occ_step = (tp2 != 0).to(tl.int32) * tl.where(in_seg, 1, 0)
-            has_intermediate = has_intermediate | occ_step
+        # ---- Slider intermediate-blocker test (one table lookup) ----
+        # Build occupancy bitboard (scalar int64) once.
+        bit_per_sq = (tl.full([1], 1, tl.int64) << sq.to(tl.int64)).to(tl.int64)
+        occ_bb = tl.sum(tl.where(pieces != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+        # Per-(from_sq, plane) precomputed bitboard of squares strictly between
+        # from_sq and the plane's to-square (board frame, side-aware).
+        side_off = tl.where(is_white_mover, 0, 64 * BLOCK_PL)
+        between_idx = side_off + rows2d * BLOCK_PL + cols2d
+        between_mask = tl.load(BETWEEN_BB_ptr + between_idx)
+        has_intermediate = ((between_mask & occ_bb) != 0).to(tl.int32)
 
         # ---- Compose pseudo-legal base ----
         base = (
@@ -1087,7 +1107,7 @@ def triton_legal_action_mask(vs: VState) -> Tensor:
     _legal_mask_kernel[(B,)](
         pieces, side, cr, ep, out,
         tbls["df"], tbls["dr"], tbls["kind"], tbls["ray_dir"], tbls["ray_dist"], tbls["promo"],
-        tbls["knight"], tbls["king"], tbls["wpawn"], tbls["bpawn"],
+        tbls["knight"], tbls["king"], tbls["wpawn"], tbls["bpawn"], tbls["between_bb"],
         BLOCK_SQ=64, BLOCK_PL=_PADDED_PLANES, NUM_PL=NUM_MOVE_PLANES,
         num_warps=16,
     )
