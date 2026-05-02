@@ -465,14 +465,21 @@ def _legal_tables_on(device: torch.device) -> dict[str, Tensor]:
     wpawn_tbl = _WPAWN_ATTACK.to(device=device, dtype=torch.int32).contiguous()
     bpawn_tbl = _BPAWN_ATTACK.to(device=device, dtype=torch.int32).contiguous()
 
+    # Helper: convert a Python int holding a 64-bit pattern into a signed int
+    # with the same bit pattern (since torch.int64 can't directly hold values
+    # >= 2**63). Used to build bitboard tables.
+    def _u64_to_i64(x: int) -> int:
+        return x if x < (1 << 63) else x - (1 << 64)
+
     # ----- Per-(from_sq, plane) "between" bitboards -----
     # bit `s` set iff square `s` is strictly between `from_sq` and the plane's
     # to-square along the plane's board-frame direction. 0 for non-queen-like
-    # planes and dist <= 1 (no intermediate squares).
-    # Two tables: one per side (white uses (df, dr); black uses (df, -dr)).
-    import numpy as np
+    # planes and dist <= 1 (no intermediate squares). Two tables: white uses
+    # (df, dr); black uses (df, -dr).
     QUEEN_SHIFTS = [(0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1)]
-    bb_np = np.zeros((2, 64, PAD), dtype=np.uint64)
+    bb_data: list[list[list[int]]] = [
+        [[0] * PAD for _ in range(64)] for _ in range(2)
+    ]
     for is_black in (0, 1):
         for from_sq in range(64):
             f0, r0 = from_sq & 7, from_sq >> 3
@@ -486,11 +493,154 @@ def _legal_tables_on(device: torch.device) -> dict[str, Tensor]:
                         r = r0 + qdr_b * k
                         if 0 <= f < 8 and 0 <= r < 8:
                             bits |= 1 << (r * 8 + f)
-                    bb_np[is_black, from_sq, plane] = bits
-    # Reinterpret uint64 -> int64 to put it in a torch int64 tensor (bit
-    # patterns identical; bit 63 squares show up as negative values, which is
-    # fine since we only use bitwise ops on these tensors in the kernel).
-    between_bb = torch.from_numpy(bb_np.view(np.int64).copy()).to(device=device).contiguous()
+                    bb_data[is_black][from_sq][plane] = _u64_to_i64(bits)
+    between_bb = torch.tensor(bb_data, dtype=torch.int64, device=device).contiguous()
+
+    # ----- Plane bitmask constants & per-piece-type / per-pin lookups -----
+    # Encode each as (lo, hi) int64 covering bits 0..72.
+    def _bb(planes_iter):
+        lo = 0
+        hi = 0
+        for p in planes_iter:
+            if p < 64:
+                lo |= 1 << p
+            else:
+                hi |= 1 << (p - 64)
+        return (lo, hi)
+
+    plane_q = list(range(56))         # queen-like
+    plane_k = list(range(56, 64))     # knight kind
+    plane_u = list(range(64, 73))     # underpromo
+    plane_diag = [d * 7 + (dist - 1) for d in (1, 3, 5, 7) for dist in range(1, 8)]
+    plane_orth = [d * 7 + (dist - 1) for d in (0, 2, 4, 6) for dist in range(1, 8)]
+
+    PLANE_PUSH1 = [0 * 7 + 0]                      # forward 1
+    PLANE_PUSH2 = [0 * 7 + 1]                      # forward 2
+    PLANE_CAP_E = [1 * 7 + 0]                      # NE 1 (mover frame)
+    PLANE_CAP_W = [7 * 7 + 0]                      # NW 1
+    UNDERPROMO_PUSH = [64 + p_idx * 3 + 1 for p_idx in range(3)]  # file_d=0
+    UNDERPROMO_CAP = [p for p in plane_u if p not in UNDERPROMO_PUSH]
+    PUSH_PLANES = PLANE_PUSH1 + PLANE_PUSH2 + UNDERPROMO_PUSH
+    CAP_PLANES = PLANE_CAP_E + PLANE_CAP_W + UNDERPROMO_CAP
+    PLANE_CE_IDX = 2 * 7 + 1   # 15  (E dist 2)
+    PLANE_CW_IDX = 6 * 7 + 1   # 43  (W dist 2)
+    IS_CASTLE = [PLANE_CE_IDX, PLANE_CW_IDX]
+    PLANE_VALID = list(range(NPL))
+
+    # Pawn queen-like allowed: forward 1, 2 + diag captures.
+    pawn_q_ok = (
+        [0 * 7 + 0, 0 * 7 + 1]            # forward 1, 2
+        + [1 * 7 + 0, 7 * 7 + 0]          # diag captures (mover frame)
+    )
+    # King queen-like dist=1 (8 directions).
+    king_dist1 = [d * 7 + 0 for d in range(8)]
+
+    # Per-piece-type allowed planes, indexed by piece type 0..6 (0 = empty).
+    plane_allowed_per_pt = [
+        [],                             # 0 empty
+        pawn_q_ok + plane_u,            # 1 pawn
+        plane_k,                        # 2 knight
+        plane_diag,                     # 3 bishop
+        plane_orth,                     # 4 rook
+        plane_q,                        # 5 queen
+        king_dist1,                     # 6 king
+    ]
+    plane_allowed_data = [
+        [_u64_to_i64(v) for v in _bb(planes)]
+        for planes in plane_allowed_per_pt
+    ]
+    plane_allowed_bb = torch.tensor(
+        plane_allowed_data, dtype=torch.int64, device=device
+    ).contiguous()
+
+    # Per-side per-board-frame-direction plane bitmask: which planes have
+    # board-frame move direction == d (or include both d and (d+4)%8 for the
+    # pin-movable lookup below).
+    # Direction codes:
+    #   0:N(0,1) 1:NE(1,1) 2:E(1,0) 3:SE(1,-1)
+    #   4:S(0,-1) 5:SW(-1,-1) 6:W(-1,0) 7:NW(-1,1)
+    DIR_OF = {(0, 1): 0, (1, 1): 1, (1, 0): 2, (1, -1): 3,
+              (0, -1): 4, (-1, -1): 5, (-1, 0): 6, (-1, 1): 7}
+
+    def _board_dir_for_plane(plane: int, side_black: int) -> int:
+        if plane < 56:
+            d_idx, dist_m1 = divmod(plane, 7)
+            df_p, dr_p = QUEEN_SHIFTS[d_idx]
+            dr_b = -dr_p if side_black else dr_p
+            df_u = (1 if df_p > 0 else (-1 if df_p < 0 else 0))
+            dr_u = (1 if dr_b > 0 else (-1 if dr_b < 0 else 0))
+            return DIR_OF.get((df_u, dr_u), -1)
+        if plane < 64:
+            return -1  # knight has no single direction
+        # underpromo: file_d in {-1, 0, +1}, dr in mover frame = +1 → board: ±1
+        local = plane - 64
+        file_idx = local % 3
+        df = file_idx - 1
+        dr = -1 if side_black else 1
+        return DIR_OF.get((df, dr), -1)
+
+    # Pin-movable plane bitmask: indexed by [side, pin_idx, lo/hi].
+    # pin_idx 0..7 = pinned along board-frame direction d. Movable planes =
+    #   { p : board_dir(p, side) == d or board_dir(p, side) == (d+4) % 8 }.
+    # pin_idx 8 = unpinned → all planes valid (PLANE_VALID).
+    pin_movable_data = [[[0, 0] for _ in range(9)] for _ in range(2)]
+    for side_black in (0, 1):
+        for d in range(8):
+            opp = (d + 4) % 8
+            planes = [
+                p for p in range(NPL)
+                if _board_dir_for_plane(p, side_black) in (d, opp)
+            ]
+            lo, hi = _bb(planes)
+            pin_movable_data[side_black][d] = [_u64_to_i64(lo), _u64_to_i64(hi)]
+        lo, hi = _bb(PLANE_VALID)
+        pin_movable_data[side_black][8] = [_u64_to_i64(lo), _u64_to_i64(hi)]
+    pin_movable_bb = torch.tensor(
+        pin_movable_data, dtype=torch.int64, device=device
+    ).contiguous()
+
+    # Per-(side, from_sq) on-board bitmask: bit `plane` set iff plane is on
+    # the board from this from_sq. Replaces the per-cell on-board int math.
+    # Also precompute real_to[side, from_sq, plane] (int8) — the board-frame
+    # to-square for each (from_sq, plane) under the given mover side. 0 for
+    # off-board (gated by on_board_bb at the use site).
+    on_board_data = [[[0, 0] for _ in range(64)] for _ in range(2)]
+    real_to_data = [[[0] * PAD for _ in range(64)] for _ in range(2)]
+    for side_black in (0, 1):
+        for from_sq in range(64):
+            f0, r0 = from_sq & 7, from_sq >> 3
+            planes_ok: list[int] = []
+            for p in range(NPL):
+                df_v = int(g["df"][from_sq, p])
+                dr_v_mf = int(g["dr"][from_sq, p])
+                dr_v = -dr_v_mf if side_black else dr_v_mf
+                f1 = f0 + df_v
+                r1 = r0 + dr_v
+                if 0 <= f1 < 8 and 0 <= r1 < 8:
+                    planes_ok.append(p)
+                    real_to_data[side_black][from_sq][p] = r1 * 8 + f1
+            lo, hi = _bb(planes_ok)
+            on_board_data[side_black][from_sq] = [_u64_to_i64(lo), _u64_to_i64(hi)]
+    on_board_bb = torch.tensor(
+        on_board_data, dtype=torch.int64, device=device
+    ).contiguous()
+    real_to_tbl = torch.tensor(
+        real_to_data, dtype=torch.int8, device=device
+    ).contiguous()
+
+    # Single-plane scalar bitmasks (lo, hi). Passed as constexpr ints into the
+    # kernel — they're tiny and held in a single register slot.
+    BB_SCALARS = {
+        "is_q":   _bb(plane_q),
+        "is_u":   _bb(plane_u),
+        "is_castle": _bb(IS_CASTLE),
+        "push": _bb(PUSH_PLANES),
+        "cap":  _bb(CAP_PLANES),
+        "push1": _bb(PLANE_PUSH1),
+        "push2": _bb(PLANE_PUSH2),
+        "underpromo_push": _bb(UNDERPROMO_PUSH),
+        "plane_valid": _bb(PLANE_VALID),
+    }
 
     cached = {
         "df": df,
@@ -504,6 +654,11 @@ def _legal_tables_on(device: torch.device) -> dict[str, Tensor]:
         "wpawn": wpawn_tbl,
         "bpawn": bpawn_tbl,
         "between_bb": between_bb,
+        "plane_allowed_bb": plane_allowed_bb,
+        "pin_movable_bb": pin_movable_bb,
+        "on_board_bb": on_board_bb,
+        "real_to_tbl": real_to_tbl,
+        "bb_scalars": BB_SCALARS,
     }
     _LEGAL_TABLES_CACHE[device] = cached
     return cached
@@ -529,6 +684,19 @@ if _HAS_TRITON:
         WPAWN_TBL_ptr,
         BPAWN_TBL_ptr,
         BETWEEN_BB_ptr,    # int64 [2, 64, PAD]  (white, black)
+        PLANE_ALLOWED_BB_ptr,  # int64 [7, 2]   per piece-type
+        PIN_MOVABLE_BB_ptr,    # int64 [2, 9, 2] per side per pin-state
+        ON_BOARD_BB_ptr,       # int64 [2, 64, 2] per side per from-sq
+        REAL_TO_TBL_ptr,       # int8  [2, 64, PAD] per side per (from, plane)
+        BB_IS_Q_LO: tl.constexpr,   BB_IS_Q_HI: tl.constexpr,
+        BB_IS_U_LO: tl.constexpr,   BB_IS_U_HI: tl.constexpr,
+        BB_IS_CASTLE_LO: tl.constexpr, BB_IS_CASTLE_HI: tl.constexpr,
+        BB_PUSH_LO: tl.constexpr,   BB_PUSH_HI: tl.constexpr,
+        BB_CAP_LO: tl.constexpr,    BB_CAP_HI: tl.constexpr,
+        BB_PUSH1_LO: tl.constexpr,  BB_PUSH1_HI: tl.constexpr,
+        BB_PUSH2_LO: tl.constexpr,  BB_PUSH2_HI: tl.constexpr,
+        BB_UNDERPROMO_PUSH_LO: tl.constexpr, BB_UNDERPROMO_PUSH_HI: tl.constexpr,
+        BB_PLANE_VALID_LO: tl.constexpr, BB_PLANE_VALID_HI: tl.constexpr,
         BLOCK_SQ: tl.constexpr,    # 64
         BLOCK_PL: tl.constexpr,    # 128 (PAD = output stride)
         BLOCK_PL_CHUNK: tl.constexpr,  # 64 (planes processed per chunk pass)
@@ -865,18 +1033,9 @@ if _HAS_TRITON:
 
         # Common per-from-sq quantities for the chunk loop.
         rows2d_chunk = tl.arange(0, BLOCK_SQ)[:, None]
-        rfile_from_chunk = (rows2d_chunk & 7).to(tl.int32)
-        rrank_from_chunk = (rows2d_chunk >> 3).to(tl.int32)
         forward_scalar = tl.where(is_white_mover, 8, -8)
         inter_sq_1d = tl.minimum(tl.maximum(sq + forward_scalar, 0), 63)
         inter_piece_1d = tl.load(pieces_ptr + pid * BLOCK_SQ + inter_sq_1d).to(tl.int32)
-
-        # Pin info broadcast (per-from-sq scalars).
-        pin_df_b = pin_df_per_from[:, None]
-        pin_dr_b = pin_dr_per_from[:, None]
-        pinned_per_from = pin_df_b != 99
-
-        ep_unsafe_b = ep_unsafe_per_from[:, None]
         from_piece_b = pieces[:, None]
         from_is_white_per = (from_piece_b >= 1) & (from_piece_b <= 6)
         from_is_black_per = (from_piece_b >= 7) & (from_piece_b <= 12)
@@ -885,18 +1044,48 @@ if _HAS_TRITON:
         pt_per = tl.where(from_is_black_per, from_piece_b - 6,
                           tl.where(from_is_white_per, from_piece_b, 0))
         is_pawn_per = pt_per == 1
-        is_knight_per = pt_per == 2
-        is_bishop_per = pt_per == 3
-        is_rook_per = pt_per == 4
-        is_queen_per = pt_per == 5
-        is_king_p_per = pt_per == 6
-        from_rank_mover = tl.where(is_white_mover, rrank_from_chunk, 7 - rrank_from_chunk)
+        # pt for plane-allowed lookup: 0 when piece doesn't belong to mover.
+        pt_for_lookup = tl.where(from_belongs_mover_per, pt_per, 0)
+        rrank_from = (rows2d_chunk >> 3).to(tl.int32)
+        from_rank_mover = tl.where(is_white_mover, rrank_from, 7 - rrank_from)
         mover_pawn_code = tl.where(is_white_mover, 1, 7)
 
-        side_off = tl.where(is_white_mover, 0, 64 * BLOCK_PL)
+        # ---- Per-from-sq plane bitmasks (lo, hi). ----
+        # plane-allowed by piece type, looked up via pt_for_lookup [64].
+        pt_lookup_1d = pt_for_lookup.reshape([BLOCK_SQ])
+        plane_allowed_lo_per = tl.load(PLANE_ALLOWED_BB_ptr + pt_lookup_1d * 2 + 0)
+        plane_allowed_hi_per = tl.load(PLANE_ALLOWED_BB_ptr + pt_lookup_1d * 2 + 1)
 
-        # Occupancy bitboard (used inside the chunk loop for slider blocker).
+        # On-board bb per (side, from_sq).
+        side_b_idx = tl.where(is_white_mover, 0, 1)
+        on_board_base = side_b_idx * 64 * 2
+        sq_long = tl.arange(0, BLOCK_SQ)
+        on_board_lo_per = tl.load(ON_BOARD_BB_ptr + on_board_base + sq_long * 2 + 0)
+        on_board_hi_per = tl.load(ON_BOARD_BB_ptr + on_board_base + sq_long * 2 + 1)
+
+        # Pin-movable bb per from_sq. Compute pin_idx (0..7 = direction, 8 = unpinned).
+        pin_idx = tl.where(pin_df_per_from == 99, 8,
+                  tl.where((pin_df_per_from == 0)  & (pin_dr_per_from == 1),  0,   # N
+                  tl.where((pin_df_per_from == 1)  & (pin_dr_per_from == 1),  1,   # NE
+                  tl.where((pin_df_per_from == 1)  & (pin_dr_per_from == 0),  2,   # E
+                  tl.where((pin_df_per_from == 1)  & (pin_dr_per_from == -1), 3,   # SE
+                  tl.where((pin_df_per_from == 0)  & (pin_dr_per_from == -1), 4,   # S
+                  tl.where((pin_df_per_from == -1) & (pin_dr_per_from == -1), 5,   # SW
+                  tl.where((pin_df_per_from == -1) & (pin_dr_per_from == 0),  6,   # W
+                  tl.where((pin_df_per_from == -1) & (pin_dr_per_from == 1),  7,   # NW
+                                                                              8))))))))) # fallback
+        pin_base = side_b_idx * 9 * 2
+        pin_movable_lo_per = tl.load(PIN_MOVABLE_BB_ptr + pin_base + pin_idx * 2 + 0)
+        pin_movable_hi_per = tl.load(PIN_MOVABLE_BB_ptr + pin_base + pin_idx * 2 + 1)
+
+        ep_unsafe_b = ep_unsafe_per_from[:, None]
+
+        # Occupancy bitboard (used inside chunk loop for slider blocker).
         occ_bb = tl.sum(tl.where(pieces != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+
+        # Side offset for the [2, 64, PAD] tables (between_bb, real_to_tbl).
+        side_off = tl.where(is_white_mover, 0, 64 * BLOCK_PL)
+        side_off_int8 = tl.where(is_white_mover, 0, 64 * BLOCK_PL)
 
         # Plane-index constants for castling re-enable.
         PLANE_CE = 2 * 7 + 1   # 15
@@ -905,22 +1094,57 @@ if _HAS_TRITON:
         # ----- Phase 5+6+7: per-(from_sq, plane) work, in 2 chunks of 64 planes -----
         for chunk_idx in tl.static_range(0, BLOCK_PL // BLOCK_PL_CHUNK):
             plane_off = chunk_idx * BLOCK_PL_CHUNK
-            cols2d = (tl.arange(0, BLOCK_PL_CHUNK) + plane_off)[None, :]
-            plane_valid_chunk = cols2d < NUM_PL  # [1, BLOCK_PL_CHUNK]
+            local_pl = tl.arange(0, BLOCK_PL_CHUNK)         # [BLOCK_PL_CHUNK]
+            local_pl_2d = local_pl[None, :]                 # [1, BLOCK_PL_CHUNK]
+            local_pl_64 = local_pl.to(tl.int64)
+            cols2d = local_pl_2d + plane_off                # absolute plane idx
             flat_idx = rows2d_chunk * BLOCK_PL + cols2d
 
-            # ---- Load plane-geom tables for this chunk. ----
-            df = tl.load(df_tbl_ptr + flat_idx).to(tl.int32)
-            dr = tl.load(dr_tbl_ptr + flat_idx).to(tl.int32)
-            kind_v = tl.load(kind_tbl_ptr + flat_idx).to(tl.int32)
-            ray_dir = tl.load(ray_dir_tbl_ptr + flat_idx).to(tl.int32)
-            ray_dist = tl.load(ray_dist_tbl_ptr + flat_idx).to(tl.int32)
+            # Select per-chunk lo/hi half of bb constants.
+            if chunk_idx == 0:
+                allowed_per = plane_allowed_lo_per
+                onboard_per = on_board_lo_per
+                pin_mov_per = pin_movable_lo_per
+                bb_is_q   = BB_IS_Q_LO
+                bb_is_u   = BB_IS_U_LO
+                bb_castle = BB_IS_CASTLE_LO
+                bb_push   = BB_PUSH_LO
+                bb_cap    = BB_CAP_LO
+                bb_push1  = BB_PUSH1_LO
+                bb_push2  = BB_PUSH2_LO
+                bb_uppush = BB_UNDERPROMO_PUSH_LO
+                bb_pvalid = BB_PLANE_VALID_LO
+            else:
+                allowed_per = plane_allowed_hi_per
+                onboard_per = on_board_hi_per
+                pin_mov_per = pin_movable_hi_per
+                bb_is_q   = BB_IS_Q_HI
+                bb_is_u   = BB_IS_U_HI
+                bb_castle = BB_IS_CASTLE_HI
+                bb_push   = BB_PUSH_HI
+                bb_cap    = BB_CAP_HI
+                bb_push1  = BB_PUSH1_HI
+                bb_push2  = BB_PUSH2_HI
+                bb_uppush = BB_UNDERPROMO_PUSH_HI
+                bb_pvalid = BB_PLANE_VALID_HI
 
-            dr_signed = tl.where(is_white_mover, dr, -dr)
-            rfile_to = rfile_from_chunk + df
-            rrank_to = rrank_from_chunk + dr_signed
-            on_board2d = (rfile_to >= 0) & (rfile_to < 8) & (rrank_to >= 0) & (rrank_to < 8)
-            real_to = tl.where(on_board2d, rrank_to * 8 + rfile_to, 0)
+            # Per-cell predicates from per-from-sq u64s + per-plane bit-pos.
+            allowed_bool = ((allowed_per[:, None] >> local_pl_64[None, :]) & 1) != 0
+            on_board2d = ((onboard_per[:, None] >> local_pl_64[None, :]) & 1) != 0
+            pin_at_ft = ((pin_mov_per[:, None] >> local_pl_64[None, :]) & 1) != 0
+
+            # Per-plane scalar bb -> per-cell bool (broadcast across rows).
+            is_q   = ((bb_is_q   >> local_pl_64) & 1) != 0   # [BLOCK_PL_CHUNK]
+            is_u   = ((bb_is_u   >> local_pl_64) & 1) != 0
+            is_castle_plane = ((bb_castle >> local_pl_64) & 1) != 0
+            push_planes = ((bb_push >> local_pl_64) & 1) != 0
+            cap_planes  = ((bb_cap  >> local_pl_64) & 1) != 0
+            is_push1 = ((bb_push1 >> local_pl_64) & 1) != 0
+            is_push2 = ((bb_push2 >> local_pl_64) & 1) != 0
+            plane_valid_chunk = ((bb_pvalid >> local_pl_64) & 1) != 0
+
+            # real_to from precomputed table.
+            real_to = tl.load(REAL_TO_TBL_ptr + side_off_int8 + flat_idx).to(tl.int32)
             real_to_64 = real_to.to(tl.int64)
 
             # to-sq piece (gather from pieces).
@@ -934,32 +1158,6 @@ if _HAS_TRITON:
             to_is_empty = to_piece == 0
             to_is_enemy = tl.where(is_white_mover, to_is_black, to_is_white)
 
-            # Plane-allowed per piece type.
-            is_q = kind_v == 0
-            is_k = kind_v == 1
-            is_u = kind_v == 2
-            is_diag_dir = (ray_dir == 1) | (ray_dir == 3) | (ray_dir == 5) | (ray_dir == 7)
-            is_orth_dir = (ray_dir == 0) | (ray_dir == 2) | (ray_dir == 4) | (ray_dir == 6)
-
-            pawn_q_ok = is_q & (
-                ((ray_dir == 0) & ((ray_dist == 1) | (ray_dist == 2)))
-                | (((ray_dir == 1) | (ray_dir == 7)) & (ray_dist == 1))
-            )
-            bishop_q_ok = is_q & is_diag_dir
-            rook_q_ok = is_q & is_orth_dir
-            queen_q_ok = is_q
-            king_q_ok = is_q & (ray_dist == 1)
-            knight_k_ok = is_k
-
-            plane_allowed = (
-                (is_pawn_per & (pawn_q_ok | is_u))
-                | (is_knight_per & knight_k_ok)
-                | (is_bishop_per & bishop_q_ok)
-                | (is_rook_per & rook_q_ok)
-                | (is_queen_per & queen_q_ok)
-                | (is_king_p_per & king_q_ok)
-            )
-
             # Slider intermediate-blocker test (precomputed bitboards).
             between_idx = side_off + rows2d_chunk * BLOCK_PL + cols2d
             between_mask = tl.load(BETWEEN_BB_ptr + between_idx)
@@ -967,61 +1165,44 @@ if _HAS_TRITON:
 
             # Compose pseudo-legal base.
             base = (
-                from_belongs_mover_per & plane_allowed & on_board2d
+                from_belongs_mover_per & allowed_bool & on_board2d
                 & (to_is_empty | to_is_enemy)
             )
-            base = base & ~(is_q & has_intermediate)
+            base = base & ~(is_q[None, :] & has_intermediate)
 
             # Pawn-specific filtering.
-            is_pawn_push1 = is_q & (ray_dir == 0) & (ray_dist == 1)
-            is_pawn_push2 = is_q & (ray_dir == 0) & (ray_dist == 2)
-            is_pawn_cap_e = is_q & (ray_dir == 1) & (ray_dist == 1)
-            is_pawn_cap_w = is_q & (ray_dir == 7) & (ray_dist == 1)
-            underpromo_push = is_u & (df == 0)
-            underpromo_cap = is_u & (df != 0)
-            push_planes = is_pawn_push1 | is_pawn_push2 | underpromo_push
-            cap_planes = is_pawn_cap_e | is_pawn_cap_w | underpromo_cap
-
-            base = base & ~(is_pawn_per & push_planes & ~to_is_empty)
-
+            base = base & ~(is_pawn_per & push_planes[None, :] & ~to_is_empty)
             is_ep_target_cell = (ep >= 0) & (real_to == ep)
-            base = base & ~(is_pawn_per & cap_planes & ~(to_is_enemy | is_ep_target_cell))
+            base = base & ~(is_pawn_per & cap_planes[None, :] & ~(to_is_enemy | is_ep_target_cell))
 
-            bad_push2_rank = is_pawn_per & is_pawn_push2 & (from_rank_mover != 1)
+            bad_push2_rank = is_pawn_per & is_push2[None, :] & (from_rank_mover != 1)
             base = base & ~bad_push2_rank
             inter_piece = inter_piece_1d[:, None] + tl.zeros([BLOCK_SQ, BLOCK_PL_CHUNK], tl.int32)
-            bad_push2_blocked = is_pawn_per & is_pawn_push2 & (inter_piece != 0)
+            bad_push2_blocked = is_pawn_per & is_push2[None, :] & (inter_piece != 0)
             base = base & ~bad_push2_blocked
 
-            to_rank_mover = tl.where(is_white_mover, rrank_to, 7 - rrank_to)
-            bad_underpromo = is_pawn_per & is_u & (to_rank_mover != 7) & on_board2d
+            # Underpromo destination must be mover-frame rank 7 (= rank 7 white,
+            # rank 0 black). Enforce by checking real_to.
+            to_rank_mover = tl.where(is_white_mover, real_to >> 3, 7 - (real_to >> 3))
+            bad_underpromo = is_pawn_per & is_u[None, :] & (to_rank_mover != 7) & on_board2d
             base = base & ~bad_underpromo
 
             # Disable naive king dist-2 moves; legal castles re-added below.
-            is_castle_plane = is_q & ((ray_dir == 2) | (ray_dir == 6)) & (ray_dist == 2)
-            base = base & ~(is_king_p_per & is_castle_plane)
+            base = base & ~(from_is_king_per & is_castle_plane[None, :])
 
-            # Legality filter.
-            ea_at_to = ((ea_bb >> real_to_64) & 1) != 0
-            king_legal = ~ea_at_to
+            # Legality filter (king vs non-king).
+            ea_at_to = ((ea_bb  >> real_to_64) & 1) != 0
             boc_at_to = ((boc_bb >> real_to_64) & 1) != 0
-
-            m_df_u = tl.where(df > 0, 1, tl.where(df < 0, -1, 0))
-            m_dr_u_mover = tl.where(dr > 0, 1, tl.where(dr < 0, -1, 0))
-            m_dr_u_board = tl.where(is_white_mover, m_dr_u_mover, -m_dr_u_mover)
-            same = (m_df_u == pin_df_b) & (m_dr_u_board == pin_dr_b)
-            opp = (m_df_u == -pin_df_b) & (m_dr_u_board == -pin_dr_b)
-            pin_at_ft = ~pinned_per_from | ((same | opp) & ~is_k)
-
+            king_legal = ~ea_at_to
             non_king_legal = (~double_check) & pin_at_ft & (~in_check | boc_at_to)
             legal_flag = tl.where(from_is_king_per, king_legal, non_king_legal)
-            out_mask = base & legal_flag & plane_valid_chunk
+            out_mask = base & legal_flag & plane_valid_chunk[None, :]
 
             # Castling re-enable for the specific castle planes.
-            is_ce = (rows2d_chunk == 4) & (cols2d == PLANE_CE) & side_white
-            is_cw = (rows2d_chunk == 4) & (cols2d == PLANE_CW) & side_white
-            is_ce_b = (rows2d_chunk == 60) & (cols2d == PLANE_CE) & side_black
-            is_cw_b = (rows2d_chunk == 60) & (cols2d == PLANE_CW) & side_black
+            is_ce = (rows2d_chunk == 4) & (cols2d == PLANE_CE) & is_white_mover
+            is_cw = (rows2d_chunk == 4) & (cols2d == PLANE_CW) & is_white_mover
+            is_ce_b = (rows2d_chunk == 60) & (cols2d == PLANE_CE) & (~is_white_mover)
+            is_cw_b = (rows2d_chunk == 60) & (cols2d == PLANE_CW) & (~is_white_mover)
             out_mask = out_mask | (is_ce & wk_ok)
             out_mask = out_mask | (is_cw & wq_ok)
             out_mask = out_mask | (is_ce_b & bk_ok)
@@ -1059,10 +1240,24 @@ def triton_legal_action_mask(vs: VState) -> Tensor:
     ep = vs.en_passant.contiguous()
 
     out = torch.empty(B, 64, _PADDED_PLANES, dtype=torch.int8, device=device)
+    bb = tbls["bb_scalars"]
     _legal_mask_kernel[(B,)](
         pieces, side, cr, ep, out,
         tbls["df"], tbls["dr"], tbls["kind"], tbls["ray_dir"], tbls["ray_dist"], tbls["promo"],
         tbls["knight"], tbls["king"], tbls["wpawn"], tbls["bpawn"], tbls["between_bb"],
+        tbls["plane_allowed_bb"], tbls["pin_movable_bb"], tbls["on_board_bb"],
+        tbls["real_to_tbl"],
+        BB_IS_Q_LO=bb["is_q"][0], BB_IS_Q_HI=bb["is_q"][1],
+        BB_IS_U_LO=bb["is_u"][0], BB_IS_U_HI=bb["is_u"][1],
+        BB_IS_CASTLE_LO=bb["is_castle"][0], BB_IS_CASTLE_HI=bb["is_castle"][1],
+        BB_PUSH_LO=bb["push"][0], BB_PUSH_HI=bb["push"][1],
+        BB_CAP_LO=bb["cap"][0], BB_CAP_HI=bb["cap"][1],
+        BB_PUSH1_LO=bb["push1"][0], BB_PUSH1_HI=bb["push1"][1],
+        BB_PUSH2_LO=bb["push2"][0], BB_PUSH2_HI=bb["push2"][1],
+        BB_UNDERPROMO_PUSH_LO=bb["underpromo_push"][0],
+        BB_UNDERPROMO_PUSH_HI=bb["underpromo_push"][1],
+        BB_PLANE_VALID_LO=bb["plane_valid"][0],
+        BB_PLANE_VALID_HI=bb["plane_valid"][1],
         BLOCK_SQ=64, BLOCK_PL=_PADDED_PLANES, BLOCK_PL_CHUNK=64,
         NUM_PL=NUM_MOVE_PLANES,
         num_warps=4,
