@@ -161,7 +161,146 @@ if _HAS_TRITON:
         tl.store(out_fmn_ptr + pid, new_fmn.to(tl.int16))
 
 
+if _HAS_TRITON:
+
+    @triton.jit
+    def _enemy_attacks_xray_kernel(
+        pieces_ptr,  # int8 [B, 64]
+        side_ptr,    # int8 [B]
+        output_ptr,  # uint8 [B, 64]
+        KNIGHT_TBL_ptr,  # int8 [64*64]
+        KING_TBL_ptr,
+        WPAWN_TBL_ptr,
+        BPAWN_TBL_ptr,
+        BLOCK_SQ: tl.constexpr,  # 64
+    ):
+        """Compute squares attacked by the side NOT to move, with the mover's
+        king removed (for king-move legality / pseudo castling check).
+
+        One program per board. Output is bool [B, 64] (uint8: 0 or 1).
+        """
+        pid = tl.program_id(axis=0)
+        sq = tl.arange(0, BLOCK_SQ)
+
+        pieces = tl.load(pieces_ptr + pid * BLOCK_SQ + sq).to(tl.int32)
+        side = tl.load(side_ptr + pid).to(tl.int32)
+        is_white_mover = side == 0
+
+        # Remove mover's king. Piece codes: WK=6, BK=12.
+        king_code = tl.where(is_white_mover, 6, 12)
+        is_king_sq = pieces == king_code
+        pieces_nk = tl.where(is_king_sq, 0, pieces)
+
+        # Enemy piece codes (mover white -> enemy black starts at code 7).
+        pawn_code = tl.where(is_white_mover, 7, 1)
+        knight_code = tl.where(is_white_mover, 8, 2)
+        bishop_code = tl.where(is_white_mover, 9, 3)
+        rook_code = tl.where(is_white_mover, 10, 4)
+        queen_code = tl.where(is_white_mover, 11, 5)
+        enemy_king_code = tl.where(is_white_mover, 12, 6)
+
+        enemy_pawn = (pieces_nk == pawn_code).to(tl.int32)
+        enemy_knight = (pieces_nk == knight_code).to(tl.int32)
+        enemy_king = (pieces_nk == enemy_king_code).to(tl.int32)
+
+        # ---- Jump attacks (matmul over the [64,64] attack tables) ----
+        rows = tl.arange(0, BLOCK_SQ)[:, None]
+        cols = tl.arange(0, BLOCK_SQ)[None, :]
+        KNIGHT_TBL = tl.load(KNIGHT_TBL_ptr + rows * 64 + cols).to(tl.int32)
+        KING_TBL = tl.load(KING_TBL_ptr + rows * 64 + cols).to(tl.int32)
+        BP_TBL = tl.load(BPAWN_TBL_ptr + rows * 64 + cols).to(tl.int32)
+        WP_TBL = tl.load(WPAWN_TBL_ptr + rows * 64 + cols).to(tl.int32)
+        # When mover is white, enemy is black, use BPAWN_TBL (black pawn attacks).
+        PAWN_TBL = tl.where(is_white_mover, BP_TBL, WP_TBL)
+
+        # attacks[sq] = OR_k (enemy[k] & TBL[k, sq])
+        knight_atk = (tl.sum(enemy_knight[:, None] * KNIGHT_TBL, axis=0) > 0).to(tl.int32)
+        king_atk = (tl.sum(enemy_king[:, None] * KING_TBL, axis=0) > 0).to(tl.int32)
+        pawn_atk = (tl.sum(enemy_pawn[:, None] * PAWN_TBL, axis=0) > 0).to(tl.int32)
+
+        # ---- Slider attacks via per-target ray walks ----
+        # For each target sq, walk outward in 8 directions; first piece
+        # encountered (if matching slider type for that direction) is an
+        # attacker. tl.gather lets us read pieces_nk at variable indices.
+        file_sq = sq & 7
+        rank_sq = sq >> 3
+
+        is_orth_slider = ((pieces_nk == rook_code) | (pieces_nk == queen_code)).to(tl.int32)
+        is_diag_slider = ((pieces_nk == bishop_code) | (pieces_nk == queen_code)).to(tl.int32)
+
+        slider_atk = tl.zeros([BLOCK_SQ], tl.int32)
+
+        # Direction (df, dr) for each of 8 dirs; orth flag indicates rook-like.
+        # Order: N, NE, E, SE, S, SW, W, NW.
+        DFS = [0, 1, 1, 1, 0, -1, -1, -1]
+        DRS = [1, 1, 0, -1, -1, -1, 0, 1]
+        ORTH = [True, False, True, False, True, False, True, False]
+
+        for d_idx in tl.static_range(0, 8):
+            df = DFS[d_idx]
+            dr = DRS[d_idx]
+            is_orth = ORTH[d_idx]
+            walking = tl.full([BLOCK_SQ], 1, tl.int32)
+            for step in tl.static_range(1, 8):
+                target_file = file_sq + df * step
+                target_rank = rank_sq + dr * step
+                on_board = ((target_file >= 0) & (target_file < 8) &
+                            (target_rank >= 0) & (target_rank < 8)).to(tl.int32)
+                target_sq = tl.where(on_board > 0, target_rank * 8 + target_file, 0)
+                target_piece = tl.gather(pieces_nk, target_sq, axis=0)
+                target_piece = tl.where(on_board > 0, target_piece, 0)
+                is_piece = (target_piece != 0).to(tl.int32)
+                first_piece = walking * is_piece
+                if is_orth:
+                    matches = ((target_piece == rook_code) |
+                               (target_piece == queen_code)).to(tl.int32)
+                else:
+                    matches = ((target_piece == bishop_code) |
+                               (target_piece == queen_code)).to(tl.int32)
+                slider_atk = slider_atk | (first_piece * matches)
+                walking = walking * (1 - is_piece) * on_board
+
+        attacks = (knight_atk | king_atk | pawn_atk | slider_atk).to(tl.int8)
+        tl.store(output_ptr + pid * BLOCK_SQ + sq, attacks)
+
+
 _TABLES_CACHE: dict[torch.device, tuple[Tensor, Tensor, Tensor, Tensor]] = {}
+_ATTACK_TABLES_CACHE: dict[torch.device, tuple[Tensor, Tensor, Tensor, Tensor]] = {}
+
+
+def _attack_tables_on(device: torch.device) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    if device not in _ATTACK_TABLES_CACHE:
+        from .vectorized import _KING_TABLE, _KNIGHT_TABLE, _WPAWN_ATTACK, _BPAWN_ATTACK
+        _ATTACK_TABLES_CACHE[device] = (
+            _KNIGHT_TABLE.to(device=device, dtype=torch.int8).contiguous().view(-1),
+            _KING_TABLE.to(device=device, dtype=torch.int8).contiguous().view(-1),
+            _WPAWN_ATTACK.to(device=device, dtype=torch.int8).contiguous().view(-1),
+            _BPAWN_ATTACK.to(device=device, dtype=torch.int8).contiguous().view(-1),
+        )
+    return _ATTACK_TABLES_CACHE[device]
+
+
+def triton_enemy_attacks_xray(vs: VState) -> Tensor:
+    """Compute [B, 64] bool: squares attacked by the side NOT to move, with
+    the mover's king removed. Single Triton kernel launch.
+    """
+    if not _HAS_TRITON:
+        raise RuntimeError("triton is not available")
+    if vs.device.type != "cuda":
+        raise RuntimeError("triton_enemy_attacks_xray requires CUDA tensors")
+    B = vs.batch_size
+    device = vs.device
+    nt, kt, wpt, bpt = _attack_tables_on(device)
+    pieces_in = vs.pieces.contiguous()
+    side_in = vs.side_to_move.contiguous()
+    out = torch.empty(B, 64, dtype=torch.uint8, device=device)
+    _enemy_attacks_xray_kernel[(B,)](
+        pieces_in, side_in, out,
+        nt, kt, wpt, bpt,
+        BLOCK_SQ=64,
+    )
+    return out.to(torch.bool)
+
 
 
 def _tables_on(device: torch.device) -> tuple[Tensor, Tensor, Tensor, Tensor]:

@@ -535,6 +535,27 @@ def _pin_constants_on(device: torch.device) -> dict[str, Tensor]:
 # ---------------------------------------------------------------------------
 
 
+def _enemy_attacks_xray(
+    vs: VState, pieces: Tensor, side: Tensor, king_sq: Tensor, B: int, device: torch.device
+) -> Tensor:
+    """Compute [B, 64] enemy_attacks_xray (king removed). Uses the Triton
+    kernel on CUDA when available; falls back to PyTorch elsewhere.
+    """
+    if device.type == "cuda":
+        try:
+            from .triton_step import _HAS_TRITON, triton_enemy_attacks_xray
+        except ImportError:
+            _HAS_TRITON = False
+        if _HAS_TRITON:
+            return triton_enemy_attacks_xray(vs)
+    pieces_no_king = pieces.clone()
+    pieces_no_king[torch.arange(B, device=device), king_sq] = 0
+    planes_no_king = to_planes(pieces_no_king.to(torch.int8))
+    attacks_xray_both = attacked_squares_both(planes_no_king)  # [B, 2, 64]
+    enemy_color_idx = (1 - side).view(B, 1, 1).expand(B, 1, 64)
+    return attacks_xray_both.gather(1, enemy_color_idx).squeeze(1)
+
+
 def _move_rook_branchless(
     pieces: Tensor, mask: Tensor, src_sq: Tensor, dst_sq: Tensor
 ) -> None:
@@ -1023,15 +1044,7 @@ def legal_action_mask(vs: VState) -> Tensor:
     # Computed up-front so we can share it with pseudo_legal_mask's castling
     # check (which is also more correct: castling f1/g1 must not be attacked
     # *after* the king vacates e1 -- i.e., with the king removed).
-    pieces_no_king = pieces.clone()
-    pieces_no_king[torch.arange(B, device=device), king_sq] = 0
-    planes_no_king = to_planes(pieces_no_king.to(torch.int8))
-    # Compute attacks-by-white and attacks-by-black in a single fused call.
-    attacks_xray_both = attacked_squares_both(planes_no_king)  # [B, 2, 64]
-    # Select the enemy color per board: enemy_color = 1 - side, so we gather
-    # the (1 - side)-th slice. Equivalent to torch.where(white_mover, [B,1,:], [B,0,:]).
-    enemy_color_idx = (1 - side).view(B, 1, 1).expand(B, 1, 64)
-    enemy_attacks_xray = attacks_xray_both.gather(1, enemy_color_idx).squeeze(1)  # [B, 64]
+    enemy_attacks_xray = _enemy_attacks_xray(vs, pieces, side, king_sq, B, device)
 
     # ---- Pseudo-legal candidates ----
     pseudo = pseudo_legal_mask(vs, _opp_attacks=enemy_attacks_xray)  # [B, 64, 73]
