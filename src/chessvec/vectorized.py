@@ -310,6 +310,59 @@ def attacked_squares(planes: Tensor, by_color: int) -> Tensor:
     return p_attacks | n_attacks | k_attacks | orth.view(B, 64) | diag.view(B, 64)
 
 
+def attacked_squares_both(planes: Tensor) -> Tensor:
+    """Return [B, 2, 64] bool: attacks_by_white at index 0, attacks_by_black at 1.
+
+    Stacks white/black slider inputs along the batch dim so that the slider
+    ray-fill loop runs once on a 2B-sized tensor rather than twice on B-sized
+    tensors. Halves the kernel-launch count of `attacked_squares` when both
+    colors are needed.
+    """
+    B = planes.shape[0]
+    occupancy = planes.any(dim=1)  # [B, 64]
+    occupancy88 = occupancy.view(B, 8, 8)
+    empty88 = ~occupancy88
+
+    tables = _jump_tables_on(planes.device)
+    knight_t = tables["knight"].float()
+    king_t = tables["king"].float()
+    wpawn_t = tables["wpawn"].float()
+    bpawn_t = tables["bpawn"].float()
+
+    # White pieces.
+    P_w, N_w, B_w, R_w, Q_w, K_w = (
+        planes[:, 0], planes[:, 1], planes[:, 2], planes[:, 3], planes[:, 4], planes[:, 5],
+    )
+    # Black pieces.
+    P_b, N_b, B_b, R_b, Q_b, K_b = (
+        planes[:, 6], planes[:, 7], planes[:, 8], planes[:, 9], planes[:, 10], planes[:, 11],
+    )
+
+    p_w = (P_w.float() @ wpawn_t) > 0
+    n_w = (N_w.float() @ knight_t) > 0
+    k_w = (K_w.float() @ king_t) > 0
+    p_b = (P_b.float() @ bpawn_t) > 0
+    n_b = (N_b.float() @ knight_t) > 0
+    k_b = (K_b.float() @ king_t) > 0
+
+    # Stack slider sources along batch dim and run one scan each for orth/diag.
+    rq_w = (R_w | Q_w).view(B, 8, 8)
+    bq_w = (B_w | Q_w).view(B, 8, 8)
+    rq_b = (R_b | Q_b).view(B, 8, 8)
+    bq_b = (B_b | Q_b).view(B, 8, 8)
+    rq_stack = torch.cat([rq_w, rq_b], dim=0)  # [2B, 8, 8]
+    bq_stack = torch.cat([bq_w, bq_b], dim=0)
+    empty_stack = empty88.repeat(2, 1, 1)  # [2B, 8, 8]
+    orth = _slider_attacks(rq_stack, empty_stack, _QUEEN_SHIFTS[0:8:2])
+    diag = _slider_attacks(bq_stack, empty_stack, _QUEEN_SHIFTS[1:8:2])
+    orth_w, orth_b = orth[:B], orth[B:]
+    diag_w, diag_b = diag[:B], diag[B:]
+
+    attacks_w = p_w | n_w | k_w | orth_w.view(B, 64) | diag_w.view(B, 64)
+    attacks_b = p_b | n_b | k_b | orth_b.view(B, 64) | diag_b.view(B, 64)
+    return torch.stack([attacks_w, attacks_b], dim=1)  # [B, 2, 64]
+
+
 # ---------------------------------------------------------------------------
 # Action-plane geometry tables.
 # Build, for each (from_sq, plane), the implied (to_sq, dr_in_mover_frame,
@@ -458,7 +511,21 @@ def _pin_constants_on(device: torch.device) -> dict[str, Tensor]:
         is_orth = torch.tensor(
             [True, False, True, False, True, False, True, False], device=device
         )
-        cached = {"is_orth_dir": is_orth}
+        # Per-side piece codes indexed by side (0=white, 1=black). Used to
+        # avoid per-call `torch.full_like(side, code)` allocations.
+        piece_codes = {
+            "king": torch.tensor([Piece.WK.value, Piece.BK.value], device=device, dtype=torch.long),
+            "knight_enemy": torch.tensor(
+                [Piece.BN.value, Piece.WN.value], device=device, dtype=torch.long
+            ),
+            "pawn_enemy": torch.tensor(
+                [Piece.BP.value, Piece.WP.value], device=device, dtype=torch.long
+            ),
+            "pawn_mover": torch.tensor(
+                [Piece.WP.value, Piece.BP.value], device=device, dtype=torch.long
+            ),
+        }
+        cached = {"is_orth_dir": is_orth, **piece_codes}
         _PIN_CONST_CACHE[device] = cached
     return cached
 
@@ -501,11 +568,21 @@ def _gather_to_pieces(pieces: Tensor, to_sq: Tensor) -> Tensor:
     return gathered
 
 
-def pseudo_legal_mask(vs: VState) -> Tensor:
+def pseudo_legal_mask(
+    vs: VState,
+    _opp_attacks: Tensor | None = None,
+) -> Tensor:
     """Return [B, 64, 73] bool pseudo-legal mask (does not filter for own
     king left in check). Castling moves have all rules baked in (rook
     presence, empty squares, intermediate squares not attacked, king not in
-    check)."""
+    check).
+
+    `_opp_attacks` is an optional precomputed [B, 64] bool map of squares
+    attacked by the opponent (the side NOT to move). When supplied (e.g. by
+    `legal_action_mask`, which already needs this map for king-in-check
+    detection), it is used directly for the castling-through-check test
+    instead of being recomputed.
+    """
     device = vs.device
     B = vs.batch_size
     pieces = vs.pieces.long()  # [B, 64]
@@ -826,13 +903,12 @@ def pseudo_legal_mask(vs: VState) -> Tensor:
     # White kingside: king on e1 (sq 4), rook on h1 (sq 7), CR_WK set,
     # squares f1, g1 empty, e1/f1/g1 not attacked by black, side==white.
     # Mirrors for the other three.
-    opp_attacks_white_to_move = attacked_squares(planes, by_color=BLACK)  # [B, 64]
-    opp_attacks_black_to_move = attacked_squares(planes, by_color=WHITE)  # [B, 64]
-    opp_attacks = torch.where(
-        (side == WHITE).view(B, 1),
-        opp_attacks_white_to_move,
-        opp_attacks_black_to_move,
-    )  # [B, 64]
+    if _opp_attacks is None:
+        attacks_both = attacked_squares_both(planes)  # [B, 2, 64]
+        enemy_color_idx = (1 - side).view(B, 1, 1).expand(B, 1, 64)
+        opp_attacks = attacks_both.gather(1, enemy_color_idx).squeeze(1)
+    else:
+        opp_attacks = _opp_attacks
 
     e1, f1, g1, d1, c1, b1, a1, h1 = 4, 5, 6, 3, 2, 1, 0, 7
     e8, f8, g8, d8, c8, b8, a8, h8 = 60, 61, 62, 59, 58, 57, 56, 63
@@ -934,17 +1010,31 @@ def legal_action_mask(vs: VState) -> Tensor:
     B = vs.batch_size
     pieces = vs.pieces.long()  # [B, 64]
     side = vs.side_to_move.long()  # [B]
-    planes = to_planes(vs.pieces)  # [B, 12, 64]
     is_white_mover_b = (side == WHITE).view(B, 1)
     is_white_mover_3 = is_white_mover_b.view(B, 1, 1)
 
-    # ---- King square ----
-    king_plane_idx = torch.where(side == WHITE, 5, 11)
-    king_planes = planes.gather(1, king_plane_idx.view(B, 1, 1).expand(B, 1, 64)).squeeze(1)
+    # ---- King square (direct equality, no full to_planes materialization) ----
+    pin_const = _pin_constants_on(device)
+    king_code = pin_const["king"][side]  # [B]
+    king_planes = pieces == king_code.view(B, 1)  # [B, 64] bool
     king_sq = king_planes.long().argmax(dim=1)  # [B]
 
+    # ---- Enemy attack map with mover's king removed (xray) ----
+    # Computed up-front so we can share it with pseudo_legal_mask's castling
+    # check (which is also more correct: castling f1/g1 must not be attacked
+    # *after* the king vacates e1 -- i.e., with the king removed).
+    pieces_no_king = pieces.clone()
+    pieces_no_king[torch.arange(B, device=device), king_sq] = 0
+    planes_no_king = to_planes(pieces_no_king.to(torch.int8))
+    # Compute attacks-by-white and attacks-by-black in a single fused call.
+    attacks_xray_both = attacked_squares_both(planes_no_king)  # [B, 2, 64]
+    # Select the enemy color per board: enemy_color = 1 - side, so we gather
+    # the (1 - side)-th slice. Equivalent to torch.where(white_mover, [B,1,:], [B,0,:]).
+    enemy_color_idx = (1 - side).view(B, 1, 1).expand(B, 1, 64)
+    enemy_attacks_xray = attacks_xray_both.gather(1, enemy_color_idx).squeeze(1)  # [B, 64]
+
     # ---- Pseudo-legal candidates ----
-    pseudo = pseudo_legal_mask(vs)  # [B, 64, 73]
+    pseudo = pseudo_legal_mask(vs, _opp_attacks=enemy_attacks_xray)  # [B, 64, 73]
 
     # ---- Recompute real_to[B, 64, 73] (in board frame) ----
     geom = _plane_geom_on(device)
@@ -987,7 +1077,6 @@ def legal_action_mask(vs: VState) -> Tensor:
         | (ray_pieces == Piece.BB.value)
         | (ray_pieces == Piece.BQ.value)
     )
-    pin_const = _pin_constants_on(device)
     is_orth_dir = pin_const["is_orth_dir"].view(1, 8, 1)  # [1, 8, 1]
     ray_slider_d = torch.where(is_orth_dir, ray_is_orth_slider, ray_is_diag_slider)
     ray_is_enemy = torch.where(is_white_mover_3, ray_is_black, ray_is_white)
@@ -1007,7 +1096,7 @@ def legal_action_mask(vs: VState) -> Tensor:
     # ---- Checkers ----
     tables = _jump_tables_on(device)
     knight_attack_to_king = tables["knight"][king_sq]  # [B, 64]
-    enemy_knight_plane = torch.where(is_white_mover_b, planes[:, 7], planes[:, 1])
+    enemy_knight_plane = pieces == pin_const["knight_enemy"][side].view(B, 1)
     knight_checkers = knight_attack_to_king & enemy_knight_plane
 
     pawn_attack_to_king = torch.where(
@@ -1015,7 +1104,7 @@ def legal_action_mask(vs: VState) -> Tensor:
         tables["bpawn_sources"][king_sq],  # for white mover, enemy is black
         tables["wpawn_sources"][king_sq],
     )
-    enemy_pawn_plane = torch.where(is_white_mover_b, planes[:, 6], planes[:, 0])
+    enemy_pawn_plane = pieces == pin_const["pawn_enemy"][side].view(B, 1)
     pawn_checkers = pawn_attack_to_king & enemy_pawn_plane
 
     # Slider checkers: scatter first_piece_sq into a [B, 64] mask where
@@ -1046,28 +1135,28 @@ def legal_action_mask(vs: VState) -> Tensor:
     )
     block_or_capture = block_buf[:, :64] | knight_checkers | pawn_checkers  # [B, 64]
 
-    # ---- Pin destinations per pinned-from square ----
+    # ---- Pin destinations per pinned-from square (fully vectorized) ----
     # pin_legal[b, from_sq, to_sq]: True iff move from→to allowed by pin.
-    pin_legal = torch.ones(B, 64, 64, dtype=torch.bool, device=device)
+    # Build allowed-destination bitmap per direction in one shot, then write
+    # all 8 direction-rows into pin_legal via a single scatter (no Python loop).
     in_pin_segment = step_idx <= step_second.view(B, 8, 1)  # [B, 8, 7]
-    for d in range(8):
-        valid_d = in_pin_segment[:, d, :] & pin_in_dir[:, d:d + 1] & (ray_squares[:, d, :] >= 0)
-        sq_d = torch.where(valid_d, ray_squares[:, d, :], torch.full_like(ray_squares[:, d, :], 64))
-        allowed_buf = torch.zeros(B, 65, dtype=torch.bool, device=device)
-        allowed_buf.scatter_(1, sq_d, torch.ones_like(sq_d, dtype=torch.bool))
-        allowed = allowed_buf[:, :64]  # [B, 64]
-        pinned_idx = first_piece_sq[:, d].clamp(min=0).view(B, 1, 1).expand(B, 1, 64)
-        existing = pin_legal.gather(1, pinned_idx)
-        new_row = torch.where(pin_in_dir[:, d].view(B, 1, 1), allowed.view(B, 1, 64), existing)
-        pin_legal.scatter_(1, pinned_idx, new_row)
+    pin_valid = in_pin_segment & pin_in_dir.view(B, 8, 1) & (ray_squares >= 0)  # [B, 8, 7]
+    pin_sq = torch.where(pin_valid, ray_squares, torch.full_like(ray_squares, 64))  # [B, 8, 7]
+    allowed_buf = torch.zeros(B, 8, 65, dtype=torch.bool, device=device)
+    allowed_buf.scatter_(2, pin_sq, torch.ones_like(pin_sq, dtype=torch.bool))
+    allowed_per_d = allowed_buf[:, :, :64]  # [B, 8, 64]
 
-    # ---- Enemy attack map with mover's king removed (for king-move legality) ----
-    pieces_no_king = pieces.clone()
-    pieces_no_king[torch.arange(B, device=device), king_sq] = 0
-    planes_no_king = to_planes(pieces_no_king.to(torch.int8))
-    attacks_xray_w = attacked_squares(planes_no_king, by_color=WHITE)
-    attacks_xray_b = attacked_squares(planes_no_king, by_color=BLACK)
-    enemy_attacks_xray = torch.where(is_white_mover_b, attacks_xray_b, attacks_xray_w)  # [B, 64]
+    # Route writes for non-pinned (b, d) to row 64 (sentinel) so they don't
+    # disturb real from-square rows. A piece can be pinned in at most one
+    # direction, so per-row writes have no real conflicts.
+    pinned_row = torch.where(
+        pin_in_dir, first_piece_sq, torch.full_like(first_piece_sq, 64)
+    )  # [B, 8]
+    pin_legal_buf = torch.ones(B, 65, 64, dtype=torch.bool, device=device)
+    pin_legal_buf.scatter_(
+        1, pinned_row.view(B, 8, 1).expand(B, 8, 64), allowed_per_d
+    )
+    pin_legal = pin_legal_buf[:, :64, :]
 
     # ---- Per-candidate legality (broadcast over [B, 64, 73]) ----
     from_piece_b = pieces.view(B, 64, 1)  # [B, 64, 1]
@@ -1103,10 +1192,7 @@ def legal_action_mask(vs: VState) -> Tensor:
     # an enemy R/Q on the same rank as ep_capture_sq?
     ep_target = vs.en_passant.long()  # [B], -1 if none
     ep_cap_sq = torch.where(side == WHITE, ep_target - 8, ep_target + 8).clamp(0, 63)
-    pawn_plane_idx = torch.where(side == WHITE, 0, 6)
-    mover_pawn = planes.gather(
-        1, pawn_plane_idx.view(B, 1, 1).expand(B, 1, 64)
-    ).squeeze(1)  # [B, 64]
+    mover_pawn = pieces == pin_const["pawn_mover"][side].view(B, 1)  # [B, 64]
     is_ep_move = (
         pseudo
         & (real_to == ep_target.view(B, 1, 1))
@@ -1444,13 +1530,9 @@ def game_result(vs: VState) -> Tensor:
     king_plane_idx = torch.where(side == WHITE, 5, 11)
     king_planes = planes.gather(1, king_plane_idx.view(B, 1, 1).expand(B, 1, 64)).squeeze(1)
     king_sq = king_planes.long().argmax(dim=1)
-    attacks_white = attacked_squares(planes, by_color=WHITE)
-    attacks_black = attacked_squares(planes, by_color=BLACK)
-    opp_attacks = torch.where(
-        (side == WHITE).view(B, 1),
-        attacks_black,
-        attacks_white,
-    )
+    attacks_both = attacked_squares_both(planes)  # [B, 2, 64]
+    enemy_color_idx = (1 - side).view(B, 1, 1).expand(B, 1, 64)
+    opp_attacks = attacks_both.gather(1, enemy_color_idx).squeeze(1)
     in_check = opp_attacks.gather(1, king_sq.view(B, 1)).squeeze(1)
 
     # 50-move rule and insufficient material.
