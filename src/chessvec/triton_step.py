@@ -280,6 +280,48 @@ def _attack_tables_on(device: torch.device) -> tuple[Tensor, Tensor, Tensor, Ten
     return _ATTACK_TABLES_CACHE[device]
 
 
+if _HAS_TRITON:
+
+    @triton.jit
+    def _slider_blockers_kernel(
+        pieces_ptr,  # int8 [B, 64]
+        output_ptr,  # uint8 [B, 64, 8, 7] cumulative blockers along each ray
+        BLOCK_SQ: tl.constexpr,  # 64
+    ):
+        """For each (board, from_sq, dir, k): is any of the squares at
+        distances 1..k+1 along direction `dir` from `from_sq` occupied?
+        Cumulative-OR across k. One program per board.
+        """
+        pid = tl.program_id(axis=0)
+        sq = tl.arange(0, BLOCK_SQ)
+        pieces = tl.load(pieces_ptr + pid * BLOCK_SQ + sq).to(tl.int32)
+
+        file_sq = sq & 7
+        rank_sq = sq >> 3
+
+        DFS = [0, 1, 1, 1, 0, -1, -1, -1]
+        DRS = [1, 1, 0, -1, -1, -1, 0, 1]
+
+        base = pid * BLOCK_SQ * 8 * 7  # output offset for this board
+        for d_idx in tl.static_range(0, 8):
+            df = DFS[d_idx]
+            dr = DRS[d_idx]
+            cum = tl.zeros([BLOCK_SQ], tl.int32)
+            for k in tl.static_range(0, 7):
+                step = k + 1
+                tf = file_sq + df * step
+                tr = rank_sq + dr * step
+                on_board = ((tf >= 0) & (tf < 8) & (tr >= 0) & (tr < 8)).to(tl.int32)
+                target_sq = tl.where(on_board > 0, tr * 8 + tf, 0)
+                target_piece = tl.gather(pieces, target_sq, axis=0)
+                target_piece = tl.where(on_board > 0, target_piece, 0)
+                is_blocker = ((target_piece != 0) & (on_board > 0)).to(tl.int32)
+                cum = cum | is_blocker
+                # Output layout: [B, 64, 8, 7] -> offset = pid*64*8*7 + sq*56 + d*7 + k.
+                offset = base + sq * 56 + d_idx * 7 + k
+                tl.store(output_ptr + offset, cum.to(tl.int8))
+
+
 def triton_enemy_attacks_xray(vs: VState) -> Tensor:
     """Compute [B, 64] bool: squares attacked by the side NOT to move, with
     the mover's king removed. Single Triton kernel launch.
@@ -372,3 +414,18 @@ def triton_step(vs: VState, action: Tensor) -> VState:
         halfmove_clock=out_hmc,
         fullmove_number=out_fmn,
     )
+
+
+def triton_slider_blockers(pieces: Tensor) -> Tensor:
+    """Compute [B, 64, 8, 7] bool: cumulative-OR ray blockers per from-sq/dir.
+    blockers[b, from_sq, dir, k] = True iff any of the squares at distance
+    1..k+1 along `dir` from `from_sq` is occupied. Single Triton launch.
+    """
+    if not _HAS_TRITON:
+        raise RuntimeError("triton is not available")
+    if pieces.device.type != "cuda":
+        raise RuntimeError("triton_slider_blockers requires CUDA tensors")
+    B = pieces.shape[0]
+    out = torch.empty(B, 64, 8, 7, dtype=torch.uint8, device=pieces.device)
+    _slider_blockers_kernel[(B,)](pieces.contiguous(), out, BLOCK_SQ=64)
+    return out.to(torch.bool)

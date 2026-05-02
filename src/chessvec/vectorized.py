@@ -535,6 +535,30 @@ def _pin_constants_on(device: torch.device) -> dict[str, Tensor]:
 # ---------------------------------------------------------------------------
 
 
+def _slider_blockers(pieces: Tensor, B: int, device: torch.device) -> Tensor:
+    """Compute [B, 64, 8, 7] cumulative slider-ray blockers. Triton fast path
+    on CUDA, PyTorch shift-loop fallback elsewhere."""
+    if device.type == "cuda":
+        try:
+            from .triton_step import _HAS_TRITON, triton_slider_blockers
+        except ImportError:
+            _HAS_TRITON = False
+        if _HAS_TRITON:
+            return triton_slider_blockers(pieces)
+    # PyTorch fallback: same shift-based scan as before, output cumulative.
+    occupancy88 = (pieces > 0).view(B, 8, 8)
+    raw = torch.zeros(B, 64, 8, 7, dtype=torch.bool, device=device)
+    for d_idx, (qdf, qdr) in enumerate(_QUEEN_SHIFTS):
+        cur = _shift(occupancy88, -qdf, -qdr)
+        for k in range(7):
+            raw[:, :, d_idx, k] = cur.reshape(B, 64)
+            cur = _shift(cur, -qdf, -qdr)
+    cum = raw.clone()
+    for k in range(1, 7):
+        cum[:, :, :, k] = cum[:, :, :, k - 1] | cum[:, :, :, k]
+    return cum
+
+
 def _enemy_attacks_xray(
     vs: VState, pieces: Tensor, side: Tensor, king_sq: Tensor, B: int, device: torch.device
 ) -> Tensor:
@@ -706,29 +730,7 @@ def pseudo_legal_mask(
     # Then "blocker before dist" = blocker_le_dist[..., dist-1] and
     # "captured-square is to_sq itself" handled via to_is_empty/enemy.
 
-    blockers = torch.zeros(B, 64, 8, 8, dtype=torch.bool, device=device)  # [B, 64, dir, k=1..7]
-    # We'll fill index k=0..6 for distances 1..7. blockers[..., d, k] =
-    # is square at distance (k+1) along direction d occupied?
-    for d_idx, (qdf, qdr) in enumerate(_QUEEN_SHIFTS):
-        # Mirror dr for black movers: but we've kept dr in mover-frame already
-        # for the action geometry. Here we work in board-frame; we need to
-        # build per-batch per-direction blocker arrays for *both* frames.
-        # Simpler: detect blockers in the board frame for each direction,
-        # and apply mover-frame mirroring lookup later.
-        cur = occupancy88
-        # shifted[k] = occupied square at offset (k+1) along (qdf, qdr) from
-        # the perspective of the from-square. Since out[r, f] = in[r-dr, f-df]
-        # for shift(df, dr), shifting once gives "occupied at (r-dr, f-df)"
-        # at position (r, f). We want "from sq (r, f), is square at
-        # (r + (k+1)*qdr, f + (k+1)*qdf) occupied?". Pulling that value back
-        # to position (r, f) requires shifting by (-(k+1)*qdf, -(k+1)*qdr)...
-        # actually shift(df, dr) returns out[r, f] = in[r-dr, f-df], so to
-        # get value at (r + step, f + step) we shift by (-step_df, -step_dr).
-        # We'll iterate: cur stores the value k+1 squares away along (qdf, qdr).
-        cur = _shift(occupancy88, -qdf, -qdr)
-        for k in range(7):
-            blockers[:, :, d_idx, k] = cur.reshape(B, 64)
-            cur = _shift(cur, -qdf, -qdr)
+    cum_blocker = _slider_blockers(vs.pieces, B, device)  # [B, 64, 8, 7] cumulative
 
     # Now build "any blocker strictly between from and to" at distance `dist`,
     # for each (from, plane). Need to mirror direction lookup for black.
@@ -746,12 +748,7 @@ def pseudo_legal_mask(
         DIR_FLIP_RANK[plane_dir.clamp_min(0)],
     )
 
-    # Look up "occupancy at distance k from from-sq in direction d":
-    # Need blockers[B, from, d, k]. We'll gather along d and k.
-    # Build "any-blocker strictly between" via cumulative OR over k=0..dist-2.
-    cum_blocker = blockers.clone()
-    for k in range(1, 7):
-        cum_blocker[:, :, :, k] = cum_blocker[:, :, :, k - 1] | cum_blocker[:, :, :, k]
+    # cum_blocker[B, 64, 8, 7] already cumulative-OR'd by `_slider_blockers`.
     # cum_blocker[..., k] = "occupied at any distance in [1..k+1]".
     # We want "occupied at any distance in [1..dist-1]"; index = dist-2 (clamp).
     blocker_idx = (plane_dist - 2).clamp_min(0)  # [B, 64, 73]
