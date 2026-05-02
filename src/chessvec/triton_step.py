@@ -530,13 +530,12 @@ if _HAS_TRITON:
         BPAWN_TBL_ptr,
         BETWEEN_BB_ptr,    # int64 [2, 64, PAD]  (white, black)
         BLOCK_SQ: tl.constexpr,    # 64
-        BLOCK_PL: tl.constexpr,    # 128 (PAD)
+        BLOCK_PL: tl.constexpr,    # 128 (PAD = output stride)
+        BLOCK_PL_CHUNK: tl.constexpr,  # 64 (planes processed per chunk pass)
         NUM_PL: tl.constexpr,      # 73
     ):
         pid = tl.program_id(axis=0)
         sq = tl.arange(0, BLOCK_SQ)              # [64]
-        pl = tl.arange(0, BLOCK_PL)              # [128]
-        plane_valid = pl < NUM_PL                # [128]
 
         # ----- Phase 1: load state -----
         pieces = tl.load(pieces_ptr + pid * BLOCK_SQ + sq).to(tl.int32)  # [64]
@@ -777,191 +776,10 @@ if _HAS_TRITON:
         in_check = num_checkers >= 1
         double_check = num_checkers >= 2
 
-        # ----- Phase 5: per-(from_sq, plane) pseudo-legal & legality -----
-        # Load plane-geom tables [64, BLOCK_PL].
-        rows2d = tl.arange(0, BLOCK_SQ)[:, None]
-        cols2d = tl.arange(0, BLOCK_PL)[None, :]
-        flat_idx = rows2d * BLOCK_PL + cols2d  # [64, PAD]
-
-        df = tl.load(df_tbl_ptr + flat_idx).to(tl.int32)
-        dr = tl.load(dr_tbl_ptr + flat_idx).to(tl.int32)
-        kind_v = tl.load(kind_tbl_ptr + flat_idx).to(tl.int32)
-        ray_dir = tl.load(ray_dir_tbl_ptr + flat_idx).to(tl.int32)
-        ray_dist = tl.load(ray_dist_tbl_ptr + flat_idx).to(tl.int32)
-        promo = tl.load(promo_tbl_ptr + flat_idx).to(tl.int32)
-
-        # Mover-frame -> board-frame dr.
-        dr_signed = tl.where(is_white_mover, dr, -dr)
-        # Real from-square per row, real-to per (row, plane).
-        rfile_from = (rows2d & 7).to(tl.int32)
-        rrank_from = (rows2d >> 3).to(tl.int32)
-        rfile_to = rfile_from + df
-        rrank_to = rrank_from + dr_signed
-        on_board2d = (rfile_to >= 0) & (rfile_to < 8) & (rrank_to >= 0) & (rrank_to < 8)
-        real_to = tl.where(on_board2d, rrank_to * 8 + rfile_to, 0)  # int32 [64, PAD]
-
-        # Piece at from-sq (per row) broadcast over cols.
-        from_piece = pieces[:, None] + tl.zeros([BLOCK_SQ, BLOCK_PL], tl.int32)
-
-        to_piece_flat = tl.gather(pieces, real_to.reshape([BLOCK_SQ * BLOCK_PL]), axis=0)
-        to_piece = to_piece_flat.reshape([BLOCK_SQ, BLOCK_PL])
-        to_piece = tl.where(on_board2d, to_piece, 0)
-
-        # Mover/enemy classification at from and to.
-        from_is_white = (from_piece >= 1) & (from_piece <= 6)
-        from_is_black = (from_piece >= 7) & (from_piece <= 12)
-        from_belongs_mover = tl.where(is_white_mover, from_is_white, from_is_black)
-
-        to_is_white = (to_piece >= 1) & (to_piece <= 6)
-        to_is_black = (to_piece >= 7) & (to_piece <= 12)
-        to_is_empty = to_piece == 0
-        to_is_enemy = tl.where(is_white_mover, to_is_black, to_is_white)
-
-        pt = tl.where(from_is_black, from_piece - 6,
-                       tl.where(from_is_white, from_piece, 0))  # 0..6
-
-        # ---- Plane-allowed per piece type ----
-        # Queen-like (kind==0):
-        #   pawn (pt=1): allowed if (dir==0 & dist∈{1,2}) | (dir∈{1,7} & dist==1)
-        #   knight: not allowed (knight uses kind==1)
-        #   bishop (pt=3): dir is diag (1,3,5,7)
-        #   rook (pt=4): dir is orth (0,2,4,6)
-        #   queen (pt=5): any
-        #   king (pt=6): any with dist==1 (castling: dist==2 too — handled via override later)
-        # Knight (kind==1): only piece type knight (pt=2).
-        # Underpromo (kind==2): pawn (pt=1).
-        is_q = kind_v == 0
-        is_k = kind_v == 1
-        is_u = kind_v == 2
-
-        # Allowed-by-piece base: (will refine below)
-        is_diag_dir = (ray_dir == 1) | (ray_dir == 3) | (ray_dir == 5) | (ray_dir == 7)
-        is_orth_dir = (ray_dir == 0) | (ray_dir == 2) | (ray_dir == 4) | (ray_dir == 6)
-
-        is_pawn = pt == 1
-        is_knight = pt == 2
-        is_bishop = pt == 3
-        is_rook = pt == 4
-        is_queen = pt == 5
-        is_king_p = pt == 6
-
-        pawn_q_ok = is_q & (
-            ((ray_dir == 0) & ((ray_dist == 1) | (ray_dist == 2)))
-            | (((ray_dir == 1) | (ray_dir == 7)) & (ray_dist == 1))
-        )
-        bishop_q_ok = is_q & is_diag_dir
-        rook_q_ok = is_q & is_orth_dir
-        queen_q_ok = is_q
-        king_q_ok = is_q & (ray_dist == 1)
-        knight_k_ok = is_k
-
-        plane_allowed = (
-            (is_pawn & (pawn_q_ok | is_u))
-            | (is_knight & knight_k_ok)
-            | (is_bishop & bishop_q_ok)
-            | (is_rook & rook_q_ok)
-            | (is_queen & queen_q_ok)
-            | (is_king_p & king_q_ok)
-        )
-
-        # ---- Slider intermediate-blocker test (one table lookup) ----
-        # Occupancy bitboard (scalar int64); bit_per_sq was built in Phase 2.
-        occ_bb = tl.sum(tl.where(pieces != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
-        # Per-(from_sq, plane) precomputed bitboard of squares strictly between
-        # from_sq and the plane's to-square (board frame, side-aware).
-        side_off = tl.where(is_white_mover, 0, 64 * BLOCK_PL)
-        between_idx = side_off + rows2d * BLOCK_PL + cols2d
-        between_mask = tl.load(BETWEEN_BB_ptr + between_idx)
-        has_intermediate = ((between_mask & occ_bb) != 0).to(tl.int32)
-
-        # ---- Compose pseudo-legal base ----
-        base = (
-            from_belongs_mover & plane_allowed & on_board2d
-            & (to_is_empty | to_is_enemy)
-        )
-        base = base & ~(is_q & (has_intermediate > 0))
-
-        # ---- Pawn-specific filtering ----
-        is_pawn_push1 = is_q & (ray_dir == 0) & (ray_dist == 1)
-        is_pawn_push2 = is_q & (ray_dir == 0) & (ray_dist == 2)
-        is_pawn_cap_e = is_q & (ray_dir == 1) & (ray_dist == 1)
-        is_pawn_cap_w = is_q & (ray_dir == 7) & (ray_dist == 1)
-        underpromo_push = is_u & (df == 0)
-        underpromo_cap = is_u & (df != 0)
-        push_planes = is_pawn_push1 | is_pawn_push2 | underpromo_push
-        cap_planes = is_pawn_cap_e | is_pawn_cap_w | underpromo_cap
-
-        # Forbid pawn pushes onto non-empty squares.
-        base = base & ~(is_pawn & push_planes & ~to_is_empty)
-
-        # Forbid pawn captures onto non-enemy unless it's en passant.
-        is_ep_target_cell = (ep >= 0) & (real_to == ep)
-        base = base & ~(is_pawn & cap_planes & ~(to_is_enemy | is_ep_target_cell))
-
-        # Pawn double-push: from rank must be mover-frame rank 1; intermediate empty.
-        from_rank_mover = tl.where(is_white_mover, rrank_from, 7 - rrank_from)
-        bad_push2_rank = is_pawn & is_pawn_push2 & (from_rank_mover != 1)
-        base = base & ~bad_push2_rank
-        # Intermediate-square-empty for double push: from_sq + 1 forward in mover frame.
-        forward = tl.where(is_white_mover, 8, -8)
-        inter_sq_1d = tl.minimum(tl.maximum(sq + forward, 0), 63)  # [64]
-        inter_piece_1d = tl.load(pieces_ptr + pid * BLOCK_SQ + inter_sq_1d).to(tl.int32)
-        inter_piece = inter_piece_1d[:, None] + tl.zeros([BLOCK_SQ, BLOCK_PL], tl.int32)
-        bad_push2_blocked = is_pawn & is_pawn_push2 & (inter_piece != 0)
-        base = base & ~bad_push2_blocked
-
-        # Underpromo destination must be mover-frame rank 7.
-        to_rank_mover = tl.where(is_white_mover, rrank_to, 7 - rrank_to)
-        bad_underpromo = is_pawn & is_u & (to_rank_mover != 7) & on_board2d
-        base = base & ~bad_underpromo
-
-        # ---- King castling: disable naive king dist-2 moves; re-enable legal ones below.
-        is_castle_plane = is_q & ((ray_dir == 2) | (ray_dir == 6)) & (ray_dist == 2)
-        base = base & ~(is_king_p & is_castle_plane)
-
-        # ---- Legality filter ----
-        # King moves: to_sq must not be in enemy_attacks (king-removed).
-        # ea_at_to[i, j] = bit `real_to[i, j]` of ea_bb. Single shift+and on the
-        # 2D tile against a scalar bitboard, no gather.
-        real_to_64 = real_to.to(tl.int64)
-        ea_at_to = ((ea_bb >> real_to_64) & 1) != 0
-        from_is_king_2d = (from_piece == own_king_code)
-        king_legal = ~ea_at_to
-
-        # Non-king: forbidden in double check; if in single check, must land on
-        # block_or_capture; respect pin.
-        boc_at_to = ((boc_bb >> real_to_64) & 1) != 0
-
-        # Pin legality (compact). Per (from_sq, plane): if the from-sq is pinned
-        # along a direction d (board frame), the move is legal iff its unit
-        # direction equals ±d. Knight moves can never satisfy a single ray
-        # direction, so a pinned knight is always rejected.
-        pin_df_b = pin_df_per_from[:, None]  # [64, 1]
-        pin_dr_b = pin_dr_per_from[:, None]
-        pinned = pin_df_b != 99
-        # Move unit-vector in board frame.
-        m_df_u = tl.where(df > 0, 1, tl.where(df < 0, -1, 0))
-        m_dr_u_mover = tl.where(dr > 0, 1, tl.where(dr < 0, -1, 0))
-        m_dr_u_board = tl.where(is_white_mover, m_dr_u_mover, -m_dr_u_mover)
-        same = (m_df_u == pin_df_b) & (m_dr_u_board == pin_dr_b)
-        opp = (m_df_u == -pin_df_b) & (m_dr_u_board == -pin_dr_b)
-        pin_at_ft = ~pinned | ((same | opp) & ~is_k)
-
-        non_king_legal = (
-            (~double_check)
-            & pin_at_ft
-            & (~in_check | boc_at_to)
-        )
-
-        legal_flag = tl.where(from_is_king_2d, king_legal, non_king_legal)
-        out_mask = base & legal_flag & plane_valid[None, :]
-
-        # ---- Phase 6: castling (re-enable specific 4 castle planes) ----
-        # Determine castle legality scalars.
-        # Identify squares.
+        # ----- Phase 4b: per-board scalar prep for castling and EP-pin -----
+        # (Hoisted out of the per-(from_sq, plane) loop so they're computed once.)
         e1, f1c, g1c, d1c, c1c, b1c, a1c, h1c = 4, 5, 6, 3, 2, 1, 0, 7
         e8, f8c, g8c, d8c, c8c, b8c, a8c, h8c = 60, 61, 62, 59, 58, 57, 56, 63
-        # Pieces at specific squares (scalar via masked sum).
         p_e1 = tl.sum(tl.where(sq == e1, pieces, 0))
         p_h1 = tl.sum(tl.where(sq == h1c, pieces, 0))
         p_a1 = tl.sum(tl.where(sq == a1c, pieces, 0))
@@ -986,90 +804,54 @@ if _HAS_TRITON:
         cr_bk = ((cr >> 2) & 1) != 0
         cr_bq = ((cr >> 3) & 1) != 0
 
-        ea_at_e1 = (ea_bb >> e1) & 1
-        ea_at_f1 = (ea_bb >> f1c) & 1
-        ea_at_g1 = (ea_bb >> g1c) & 1
-        ea_at_d1 = (ea_bb >> d1c) & 1
-        ea_at_c1 = (ea_bb >> c1c) & 1
-        ea_at_e8 = (ea_bb >> e8) & 1
-        ea_at_f8 = (ea_bb >> f8c) & 1
-        ea_at_g8 = (ea_bb >> g8c) & 1
-        ea_at_d8 = (ea_bb >> d8c) & 1
-        ea_at_c8 = (ea_bb >> c8c) & 1
-
         wk_ok = (
             side_white & cr_wk
-            & (p_e1 == 6) & (p_h1 == 4)
-            & (p_f1 == 0) & (p_g1 == 0)
-            & (ea_at_e1 == 0) & (ea_at_f1 == 0) & (ea_at_g1 == 0)
+            & (p_e1 == 6) & (p_h1 == 4) & (p_f1 == 0) & (p_g1 == 0)
+            & (((ea_bb >> e1) & 1) == 0)
+            & (((ea_bb >> f1c) & 1) == 0)
+            & (((ea_bb >> g1c) & 1) == 0)
         )
         wq_ok = (
             side_white & cr_wq
-            & (p_e1 == 6) & (p_a1 == 4)
-            & (p_d1 == 0) & (p_c1 == 0) & (p_b1 == 0)
-            & (ea_at_e1 == 0) & (ea_at_d1 == 0) & (ea_at_c1 == 0)
+            & (p_e1 == 6) & (p_a1 == 4) & (p_d1 == 0) & (p_c1 == 0) & (p_b1 == 0)
+            & (((ea_bb >> e1) & 1) == 0)
+            & (((ea_bb >> d1c) & 1) == 0)
+            & (((ea_bb >> c1c) & 1) == 0)
         )
         bk_ok = (
             side_black & cr_bk
-            & (p_e8 == 12) & (p_h8 == 10)
-            & (p_f8 == 0) & (p_g8 == 0)
-            & (ea_at_e8 == 0) & (ea_at_f8 == 0) & (ea_at_g8 == 0)
+            & (p_e8 == 12) & (p_h8 == 10) & (p_f8 == 0) & (p_g8 == 0)
+            & (((ea_bb >> e8) & 1) == 0)
+            & (((ea_bb >> f8c) & 1) == 0)
+            & (((ea_bb >> g8c) & 1) == 0)
         )
         bq_ok = (
             side_black & cr_bq
-            & (p_e8 == 12) & (p_a8 == 10)
-            & (p_d8 == 0) & (p_c8 == 0) & (p_b8 == 0)
-            & (ea_at_e8 == 0) & (ea_at_d8 == 0) & (ea_at_c8 == 0)
+            & (p_e8 == 12) & (p_a8 == 10) & (p_d8 == 0) & (p_c8 == 0) & (p_b8 == 0)
+            & (((ea_bb >> e8) & 1) == 0)
+            & (((ea_bb >> d8c) & 1) == 0)
+            & (((ea_bb >> c8c) & 1) == 0)
         )
 
-        # Plane indices for castle E (dir=2, dist=2 -> 2*7+1 = 15) and W (43).
-        PLANE_CE = 2 * 7 + 1
-        PLANE_CW = 6 * 7 + 1
-        is_ce = (rows2d == 4) & (cols2d == PLANE_CE) & side_white  # e1
-        is_cw = (rows2d == 4) & (cols2d == PLANE_CW) & side_white
-        is_ce_b = (rows2d == 60) & (cols2d == PLANE_CE) & side_black  # e8
-        is_cw_b = (rows2d == 60) & (cols2d == PLANE_CW) & side_black
-        out_mask = out_mask | (is_ce & wk_ok)
-        out_mask = out_mask | (is_cw & wq_ok)
-        out_mask = out_mask | (is_ce_b & bk_ok)
-        out_mask = out_mask | (is_cw_b & bq_ok)
-
-        # ---- Phase 7: en-passant horizontal pin ----
-        # If ep >= 0 and king is on the rank of ep_cap_sq: for each from_sq that
-        # is making an ep capture, check if removing both vacated pawns exposes
-        # the king to a horizontal R/Q.
+        # ---- EP horizontal-pin: per-from ep_unsafe[64] (state-dependent) ----
         ep_valid = ep >= 0
         ep_cap_sq = tl.where(is_white_mover, ep - 8, ep + 8)
         ep_cap_rank = ep_cap_sq >> 3
-        # is_ep_move per (from_sq, plane): mover pawn, cap plane, real_to == ep.
-        mover_pawn_code = tl.where(is_white_mover, 1, 7)
-        is_ep_move = (
-            (out_mask != 0)
-            & (real_to == ep) & (ep >= 0) & on_board2d
-            & (from_piece == mover_pawn_code)
-        )
-
-        # Build per-from ep_unsafe[64].
-        # Run only when there's any ep move possible AND king is on ep_cap_rank.
         king_on_eprank = (king_rank == ep_cap_rank) & ep_valid
         enemy_rq_v = ((pieces == rook_code) | (pieces == queen_code)).to(tl.int32)
-        # For each from_sq (sq lane), compute west_first_sq and east_first_sq
-        # on king's rank, skipping squares == from_sq, == ep_cap_sq, == king_sq.
-        # Use the [64, 64] from-vs-target structure.
-        from_lane = tl.arange(0, BLOCK_SQ)[:, None]   # from_sq
-        sq_lane = tl.arange(0, BLOCK_SQ)[None, :]     # candidate square
+        from_lane = tl.arange(0, BLOCK_SQ)[:, None]
+        sq_lane = tl.arange(0, BLOCK_SQ)[None, :]
         rank_of_sq = (sq_lane >> 3).to(tl.int32)
-        file_of_sq = (sq_lane & 7).to(tl.int32)
+        file_of_sq_2d = (sq_lane & 7).to(tl.int32)
         on_king_rank2 = rank_of_sq == king_rank
         vacated2 = (sq_lane == from_lane) | (sq_lane == ep_cap_sq) | (sq_lane == king_sq)
         occ2 = ((pieces[None, :] != 0) & on_king_rank2 & ~vacated2).to(tl.int32)
-        west_occ = occ2 & (file_of_sq < king_file).to(tl.int32)
-        east_occ = occ2 & (file_of_sq > king_file).to(tl.int32)
-        # max file among west_occ, sentinel -1 -> use -1 + 1 trick by clamping below.
-        west_file_v = tl.where(west_occ > 0, file_of_sq, -1)
-        west_first_file = tl.max(west_file_v, axis=1)            # [64]
-        east_file_v = tl.where(east_occ > 0, file_of_sq, 8)
-        east_first_file = tl.min(east_file_v, axis=1)            # [64]
+        west_occ = occ2 & (file_of_sq_2d < king_file).to(tl.int32)
+        east_occ = occ2 & (file_of_sq_2d > king_file).to(tl.int32)
+        west_file_v = tl.where(west_occ > 0, file_of_sq_2d, -1)
+        west_first_file = tl.max(west_file_v, axis=1)
+        east_file_v = tl.where(east_occ > 0, file_of_sq_2d, 8)
+        east_first_file = tl.min(east_file_v, axis=1)
         has_west = west_first_file >= 0
         has_east = east_first_file < 8
         west_sq = king_rank * 8 + tl.maximum(west_first_file, 0)
@@ -1080,14 +862,182 @@ if _HAS_TRITON:
             (((west_enemy_rq != 0) & has_west) | ((east_enemy_rq != 0) & has_east))
             & king_on_eprank
         ).to(tl.int32)
-        ep_unsafe_2d = ep_unsafe_per_from[:, None] + tl.zeros([BLOCK_SQ, BLOCK_PL], tl.int32)
 
-        out_mask = out_mask & ~(is_ep_move & (ep_unsafe_2d != 0))
+        # Common per-from-sq quantities for the chunk loop.
+        rows2d_chunk = tl.arange(0, BLOCK_SQ)[:, None]
+        rfile_from_chunk = (rows2d_chunk & 7).to(tl.int32)
+        rrank_from_chunk = (rows2d_chunk >> 3).to(tl.int32)
+        forward_scalar = tl.where(is_white_mover, 8, -8)
+        inter_sq_1d = tl.minimum(tl.maximum(sq + forward_scalar, 0), 63)
+        inter_piece_1d = tl.load(pieces_ptr + pid * BLOCK_SQ + inter_sq_1d).to(tl.int32)
 
-        # ---- Write output ----
-        # Output shape: [B, 64, BLOCK_PL] int8. We'll slice to 73 in Python.
-        out_offset = pid * BLOCK_SQ * BLOCK_PL + rows2d * BLOCK_PL + cols2d
-        tl.store(out_ptr + out_offset, out_mask.to(tl.int8))
+        # Pin info broadcast (per-from-sq scalars).
+        pin_df_b = pin_df_per_from[:, None]
+        pin_dr_b = pin_dr_per_from[:, None]
+        pinned_per_from = pin_df_b != 99
+
+        ep_unsafe_b = ep_unsafe_per_from[:, None]
+        from_piece_b = pieces[:, None]
+        from_is_white_per = (from_piece_b >= 1) & (from_piece_b <= 6)
+        from_is_black_per = (from_piece_b >= 7) & (from_piece_b <= 12)
+        from_belongs_mover_per = tl.where(is_white_mover, from_is_white_per, from_is_black_per)
+        from_is_king_per = from_piece_b == own_king_code
+        pt_per = tl.where(from_is_black_per, from_piece_b - 6,
+                          tl.where(from_is_white_per, from_piece_b, 0))
+        is_pawn_per = pt_per == 1
+        is_knight_per = pt_per == 2
+        is_bishop_per = pt_per == 3
+        is_rook_per = pt_per == 4
+        is_queen_per = pt_per == 5
+        is_king_p_per = pt_per == 6
+        from_rank_mover = tl.where(is_white_mover, rrank_from_chunk, 7 - rrank_from_chunk)
+        mover_pawn_code = tl.where(is_white_mover, 1, 7)
+
+        side_off = tl.where(is_white_mover, 0, 64 * BLOCK_PL)
+
+        # Occupancy bitboard (used inside the chunk loop for slider blocker).
+        occ_bb = tl.sum(tl.where(pieces != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+
+        # Plane-index constants for castling re-enable.
+        PLANE_CE = 2 * 7 + 1   # 15
+        PLANE_CW = 6 * 7 + 1   # 43
+
+        # ----- Phase 5+6+7: per-(from_sq, plane) work, in 2 chunks of 64 planes -----
+        for chunk_idx in tl.static_range(0, BLOCK_PL // BLOCK_PL_CHUNK):
+            plane_off = chunk_idx * BLOCK_PL_CHUNK
+            cols2d = (tl.arange(0, BLOCK_PL_CHUNK) + plane_off)[None, :]
+            plane_valid_chunk = cols2d < NUM_PL  # [1, BLOCK_PL_CHUNK]
+            flat_idx = rows2d_chunk * BLOCK_PL + cols2d
+
+            # ---- Load plane-geom tables for this chunk. ----
+            df = tl.load(df_tbl_ptr + flat_idx).to(tl.int32)
+            dr = tl.load(dr_tbl_ptr + flat_idx).to(tl.int32)
+            kind_v = tl.load(kind_tbl_ptr + flat_idx).to(tl.int32)
+            ray_dir = tl.load(ray_dir_tbl_ptr + flat_idx).to(tl.int32)
+            ray_dist = tl.load(ray_dist_tbl_ptr + flat_idx).to(tl.int32)
+
+            dr_signed = tl.where(is_white_mover, dr, -dr)
+            rfile_to = rfile_from_chunk + df
+            rrank_to = rrank_from_chunk + dr_signed
+            on_board2d = (rfile_to >= 0) & (rfile_to < 8) & (rrank_to >= 0) & (rrank_to < 8)
+            real_to = tl.where(on_board2d, rrank_to * 8 + rfile_to, 0)
+            real_to_64 = real_to.to(tl.int64)
+
+            # to-sq piece (gather from pieces).
+            to_piece = tl.gather(
+                pieces, real_to.reshape([BLOCK_SQ * BLOCK_PL_CHUNK]), axis=0
+            ).reshape([BLOCK_SQ, BLOCK_PL_CHUNK])
+            to_piece = tl.where(on_board2d, to_piece, 0)
+
+            to_is_white = (to_piece >= 1) & (to_piece <= 6)
+            to_is_black = (to_piece >= 7) & (to_piece <= 12)
+            to_is_empty = to_piece == 0
+            to_is_enemy = tl.where(is_white_mover, to_is_black, to_is_white)
+
+            # Plane-allowed per piece type.
+            is_q = kind_v == 0
+            is_k = kind_v == 1
+            is_u = kind_v == 2
+            is_diag_dir = (ray_dir == 1) | (ray_dir == 3) | (ray_dir == 5) | (ray_dir == 7)
+            is_orth_dir = (ray_dir == 0) | (ray_dir == 2) | (ray_dir == 4) | (ray_dir == 6)
+
+            pawn_q_ok = is_q & (
+                ((ray_dir == 0) & ((ray_dist == 1) | (ray_dist == 2)))
+                | (((ray_dir == 1) | (ray_dir == 7)) & (ray_dist == 1))
+            )
+            bishop_q_ok = is_q & is_diag_dir
+            rook_q_ok = is_q & is_orth_dir
+            queen_q_ok = is_q
+            king_q_ok = is_q & (ray_dist == 1)
+            knight_k_ok = is_k
+
+            plane_allowed = (
+                (is_pawn_per & (pawn_q_ok | is_u))
+                | (is_knight_per & knight_k_ok)
+                | (is_bishop_per & bishop_q_ok)
+                | (is_rook_per & rook_q_ok)
+                | (is_queen_per & queen_q_ok)
+                | (is_king_p_per & king_q_ok)
+            )
+
+            # Slider intermediate-blocker test (precomputed bitboards).
+            between_idx = side_off + rows2d_chunk * BLOCK_PL + cols2d
+            between_mask = tl.load(BETWEEN_BB_ptr + between_idx)
+            has_intermediate = (between_mask & occ_bb) != 0
+
+            # Compose pseudo-legal base.
+            base = (
+                from_belongs_mover_per & plane_allowed & on_board2d
+                & (to_is_empty | to_is_enemy)
+            )
+            base = base & ~(is_q & has_intermediate)
+
+            # Pawn-specific filtering.
+            is_pawn_push1 = is_q & (ray_dir == 0) & (ray_dist == 1)
+            is_pawn_push2 = is_q & (ray_dir == 0) & (ray_dist == 2)
+            is_pawn_cap_e = is_q & (ray_dir == 1) & (ray_dist == 1)
+            is_pawn_cap_w = is_q & (ray_dir == 7) & (ray_dist == 1)
+            underpromo_push = is_u & (df == 0)
+            underpromo_cap = is_u & (df != 0)
+            push_planes = is_pawn_push1 | is_pawn_push2 | underpromo_push
+            cap_planes = is_pawn_cap_e | is_pawn_cap_w | underpromo_cap
+
+            base = base & ~(is_pawn_per & push_planes & ~to_is_empty)
+
+            is_ep_target_cell = (ep >= 0) & (real_to == ep)
+            base = base & ~(is_pawn_per & cap_planes & ~(to_is_enemy | is_ep_target_cell))
+
+            bad_push2_rank = is_pawn_per & is_pawn_push2 & (from_rank_mover != 1)
+            base = base & ~bad_push2_rank
+            inter_piece = inter_piece_1d[:, None] + tl.zeros([BLOCK_SQ, BLOCK_PL_CHUNK], tl.int32)
+            bad_push2_blocked = is_pawn_per & is_pawn_push2 & (inter_piece != 0)
+            base = base & ~bad_push2_blocked
+
+            to_rank_mover = tl.where(is_white_mover, rrank_to, 7 - rrank_to)
+            bad_underpromo = is_pawn_per & is_u & (to_rank_mover != 7) & on_board2d
+            base = base & ~bad_underpromo
+
+            # Disable naive king dist-2 moves; legal castles re-added below.
+            is_castle_plane = is_q & ((ray_dir == 2) | (ray_dir == 6)) & (ray_dist == 2)
+            base = base & ~(is_king_p_per & is_castle_plane)
+
+            # Legality filter.
+            ea_at_to = ((ea_bb >> real_to_64) & 1) != 0
+            king_legal = ~ea_at_to
+            boc_at_to = ((boc_bb >> real_to_64) & 1) != 0
+
+            m_df_u = tl.where(df > 0, 1, tl.where(df < 0, -1, 0))
+            m_dr_u_mover = tl.where(dr > 0, 1, tl.where(dr < 0, -1, 0))
+            m_dr_u_board = tl.where(is_white_mover, m_dr_u_mover, -m_dr_u_mover)
+            same = (m_df_u == pin_df_b) & (m_dr_u_board == pin_dr_b)
+            opp = (m_df_u == -pin_df_b) & (m_dr_u_board == -pin_dr_b)
+            pin_at_ft = ~pinned_per_from | ((same | opp) & ~is_k)
+
+            non_king_legal = (~double_check) & pin_at_ft & (~in_check | boc_at_to)
+            legal_flag = tl.where(from_is_king_per, king_legal, non_king_legal)
+            out_mask = base & legal_flag & plane_valid_chunk
+
+            # Castling re-enable for the specific castle planes.
+            is_ce = (rows2d_chunk == 4) & (cols2d == PLANE_CE) & side_white
+            is_cw = (rows2d_chunk == 4) & (cols2d == PLANE_CW) & side_white
+            is_ce_b = (rows2d_chunk == 60) & (cols2d == PLANE_CE) & side_black
+            is_cw_b = (rows2d_chunk == 60) & (cols2d == PLANE_CW) & side_black
+            out_mask = out_mask | (is_ce & wk_ok)
+            out_mask = out_mask | (is_cw & wq_ok)
+            out_mask = out_mask | (is_ce_b & bk_ok)
+            out_mask = out_mask | (is_cw_b & bq_ok)
+
+            # EP filter.
+            is_ep_move = (
+                (out_mask != 0)
+                & (real_to == ep) & (ep >= 0) & on_board2d
+                & (from_piece_b == mover_pawn_code)
+            )
+            out_mask = out_mask & ~(is_ep_move & (ep_unsafe_b != 0))
+
+            # Write this chunk.
+            out_offset = pid * BLOCK_SQ * BLOCK_PL + rows2d_chunk * BLOCK_PL + cols2d
+            tl.store(out_ptr + out_offset, out_mask.to(tl.int8))
 
 
 def triton_legal_action_mask(vs: VState) -> Tensor:
@@ -1113,8 +1063,9 @@ def triton_legal_action_mask(vs: VState) -> Tensor:
         pieces, side, cr, ep, out,
         tbls["df"], tbls["dr"], tbls["kind"], tbls["ray_dir"], tbls["ray_dist"], tbls["promo"],
         tbls["knight"], tbls["king"], tbls["wpawn"], tbls["bpawn"], tbls["between_bb"],
-        BLOCK_SQ=64, BLOCK_PL=_PADDED_PLANES, NUM_PL=NUM_MOVE_PLANES,
-        num_warps=16,
+        BLOCK_SQ=64, BLOCK_PL=_PADDED_PLANES, BLOCK_PL_CHUNK=64,
+        NUM_PL=NUM_MOVE_PLANES,
+        num_warps=4,
     )
     return out[:, :, :NUM_MOVE_PLANES].reshape(B, ACTION_SIZE).to(torch.bool)
 
