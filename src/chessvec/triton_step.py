@@ -612,6 +612,9 @@ if _HAS_TRITON:
                 walking = walking * (1 - is_piece) * on_b
 
         enemy_attacks = (knight_atk | king_atk | pawn_atk | slider_atk)  # [64] int32 0/1
+        # Pack into a u64 bitboard (scalar). bit_per_sq used here and later.
+        bit_per_sq = (tl.full([1], 1, tl.int64) << sq.to(tl.int64)).to(tl.int64)
+        ea_bb = tl.sum(tl.where(enemy_attacks != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
 
         # ----- Phase 3: ray analysis from king -----
         # For each direction d in 0..7, walk 7 steps from king. Track first/second
@@ -765,6 +768,7 @@ if _HAS_TRITON:
         pawn_checkers = pawn_atk_to_king * enemy_pawn_at
 
         block_or_capture = block_or_capture | knight_checkers | pawn_checkers
+        boc_bb = tl.sum(tl.where(block_or_capture != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
         num_checkers = (
             num_checkers_slider
             + tl.sum(knight_checkers)
@@ -861,8 +865,7 @@ if _HAS_TRITON:
         )
 
         # ---- Slider intermediate-blocker test (one table lookup) ----
-        # Build occupancy bitboard (scalar int64) once.
-        bit_per_sq = (tl.full([1], 1, tl.int64) << sq.to(tl.int64)).to(tl.int64)
+        # Occupancy bitboard (scalar int64); bit_per_sq was built in Phase 2.
         occ_bb = tl.sum(tl.where(pieces != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
         # Per-(from_sq, plane) precomputed bitboard of squares strictly between
         # from_sq and the plane's to-square (board frame, side-aware).
@@ -918,14 +921,16 @@ if _HAS_TRITON:
 
         # ---- Legality filter ----
         # King moves: to_sq must not be in enemy_attacks (king-removed).
-        # Cast enemy_attacks to a [64, PAD] mask via gather over real_to.
-        ea_at_to = tl.gather(enemy_attacks, real_to.reshape([BLOCK_SQ * BLOCK_PL]), axis=0).reshape([BLOCK_SQ, BLOCK_PL])
+        # ea_at_to[i, j] = bit `real_to[i, j]` of ea_bb. Single shift+and on the
+        # 2D tile against a scalar bitboard, no gather.
+        real_to_64 = real_to.to(tl.int64)
+        ea_at_to = ((ea_bb >> real_to_64) & 1) != 0
         from_is_king_2d = (from_piece == own_king_code)
-        king_legal = ea_at_to == 0
+        king_legal = ~ea_at_to
 
         # Non-king: forbidden in double check; if in single check, must land on
         # block_or_capture; respect pin.
-        boc_at_to = tl.gather(block_or_capture, real_to.reshape([BLOCK_SQ * BLOCK_PL]), axis=0).reshape([BLOCK_SQ, BLOCK_PL])
+        boc_at_to = ((boc_bb >> real_to_64) & 1) != 0
 
         # Pin legality (compact). Per (from_sq, plane): if the from-sq is pinned
         # along a direction d (board frame), the move is legal iff its unit
@@ -945,7 +950,7 @@ if _HAS_TRITON:
         non_king_legal = (
             (~double_check)
             & pin_at_ft
-            & (~in_check | (boc_at_to != 0))
+            & (~in_check | boc_at_to)
         )
 
         legal_flag = tl.where(from_is_king_2d, king_legal, non_king_legal)
@@ -981,16 +986,16 @@ if _HAS_TRITON:
         cr_bk = ((cr >> 2) & 1) != 0
         cr_bq = ((cr >> 3) & 1) != 0
 
-        ea_at_e1 = tl.sum(tl.where(sq == e1, enemy_attacks, 0))
-        ea_at_f1 = tl.sum(tl.where(sq == f1c, enemy_attacks, 0))
-        ea_at_g1 = tl.sum(tl.where(sq == g1c, enemy_attacks, 0))
-        ea_at_d1 = tl.sum(tl.where(sq == d1c, enemy_attacks, 0))
-        ea_at_c1 = tl.sum(tl.where(sq == c1c, enemy_attacks, 0))
-        ea_at_e8 = tl.sum(tl.where(sq == e8, enemy_attacks, 0))
-        ea_at_f8 = tl.sum(tl.where(sq == f8c, enemy_attacks, 0))
-        ea_at_g8 = tl.sum(tl.where(sq == g8c, enemy_attacks, 0))
-        ea_at_d8 = tl.sum(tl.where(sq == d8c, enemy_attacks, 0))
-        ea_at_c8 = tl.sum(tl.where(sq == c8c, enemy_attacks, 0))
+        ea_at_e1 = (ea_bb >> e1) & 1
+        ea_at_f1 = (ea_bb >> f1c) & 1
+        ea_at_g1 = (ea_bb >> g1c) & 1
+        ea_at_d1 = (ea_bb >> d1c) & 1
+        ea_at_c1 = (ea_bb >> c1c) & 1
+        ea_at_e8 = (ea_bb >> e8) & 1
+        ea_at_f8 = (ea_bb >> f8c) & 1
+        ea_at_g8 = (ea_bb >> g8c) & 1
+        ea_at_d8 = (ea_bb >> d8c) & 1
+        ea_at_c8 = (ea_bb >> c8c) & 1
 
         wk_ok = (
             side_white & cr_wk
