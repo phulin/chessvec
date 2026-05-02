@@ -1025,6 +1025,13 @@ def legal_action_mask(vs: VState) -> Tensor:
     of the make-test approach.
     """
     device = vs.device
+    if device.type == "cuda":
+        try:
+            from .triton_step import _HAS_TRITON, triton_legal_action_mask
+        except ImportError:
+            _HAS_TRITON = False
+        if _HAS_TRITON:
+            return triton_legal_action_mask(vs)
     B = vs.batch_size
     pieces = vs.pieces.long()  # [B, 64]
     side = vs.side_to_move.long()  # [B]
