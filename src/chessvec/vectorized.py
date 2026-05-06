@@ -525,7 +525,27 @@ def _pin_constants_on(device: torch.device) -> dict[str, Tensor]:
                 [Piece.WP.value, Piece.BP.value], device=device, dtype=torch.long
             ),
         }
-        cached = {"is_orth_dir": is_orth, **piece_codes}
+        # Misc constants used elsewhere in the hot path.
+        misc = {
+            # Direction-mirror table for black mover: maps board-frame dir
+            # index 0..7 to the rank-mirrored dir.
+            "dir_flip_rank": torch.tensor(
+                [4, 3, 2, 1, 0, 7, 6, 5], device=device, dtype=torch.long
+            ),
+            "diag_dirs": torch.tensor([1, 3, 5, 7], device=device, dtype=torch.long),
+            "orth_dirs": torch.tensor([0, 2, 4, 6], device=device, dtype=torch.long),
+            # Bishop square color (0 = light, 1 = dark) per board square.
+            "sq_colors": torch.tensor(
+                [((sq >> 3) + (sq & 7)) & 1 for sq in range(64)],
+                device=device,
+                dtype=torch.long,
+            ),
+            # 0-D scalar tensors for game_result (avoid per-call allocs).
+            "result_white_win": torch.tensor(WHITE_WIN, device=device, dtype=torch.long),
+            "result_black_win": torch.tensor(BLACK_WIN, device=device, dtype=torch.long),
+            "result_draw":      torch.tensor(DRAW,      device=device, dtype=torch.long),
+        }
+        cached = {"is_orth_dir": is_orth, **piece_codes, **misc}
         _PIN_CONST_CACHE[device] = cached
     return cached
 
@@ -545,17 +565,19 @@ def _slider_blockers(pieces: Tensor, B: int, device: torch.device) -> Tensor:
             _HAS_TRITON = False
         if _HAS_TRITON:
             return triton_slider_blockers(pieces)
-    # PyTorch fallback: same shift-based scan as before, output cumulative.
-    occupancy88 = (pieces > 0).view(B, 8, 8)
-    raw = torch.zeros(B, 64, 8, 7, dtype=torch.bool, device=device)
-    for d_idx, (qdf, qdr) in enumerate(_QUEEN_SHIFTS):
-        cur = _shift(occupancy88, -qdf, -qdr)
-        for k in range(7):
-            raw[:, :, d_idx, k] = cur.reshape(B, 64)
-            cur = _shift(cur, -qdf, -qdr)
-    cum = raw.clone()
-    for k in range(1, 7):
-        cum[:, :, :, k] = cum[:, :, :, k - 1] | cum[:, :, :, k]
+    # PyTorch fallback: vectorized via the _RAY_FROM_SQ lookup table.
+    # ray_table[from_sq, d, k] = the square at step (k+1) along direction d
+    # from from_sq, or -1 if off-board. Build the cumulative-OR blocker tensor
+    # in two ops (one gather + one cummax) instead of 56 shift+assign launches.
+    ray_table = _ray_from_sq_on(device)  # [64, 8, 7] long, -1 off-board
+    safe_ray = ray_table.clamp(min=0)  # sentinel 0 (gated by `on_board` below)
+    flat_idx = safe_ray.view(1, 64 * 8 * 7).expand(B, -1)  # [B, 64*8*7]
+    occ = (pieces > 0)  # [B, 64]
+    occupied = occ.gather(1, flat_idx).view(B, 64, 8, 7)
+    on_board = (ray_table >= 0).view(1, 64, 8, 7)
+    occupied = occupied & on_board
+    # Cumulative OR along the step dim. cummax on bool == cumulative OR.
+    cum = occupied.cummax(dim=3).values
     return cum
 
 
@@ -737,7 +759,7 @@ def pseudo_legal_mask(
     # Direction in board-frame for black is the direction with dr negated.
     # _QUEEN_SHIFTS pairs: (df, dr). The "negated-dr" entry is at idx mapping
     # (df, dr) -> (df, -dr): N<->S, NE<->SE, E<->E, NW<->SW.
-    DIR_FLIP_RANK = torch.tensor([4, 3, 2, 1, 0, 7, 6, 5], device=device)  # 0..7 -> mirror
+    DIR_FLIP_RANK = _pin_constants_on(device)["dir_flip_rank"]  # 0..7 -> mirror
 
     plane_dir = ray_dir.unsqueeze(0).expand(B, -1, -1)  # [B, 64, 73] (plane-frame dir)
     plane_dist = ray_dist.unsqueeze(0).expand(B, -1, -1)  # [B, 64, 73]
@@ -776,11 +798,11 @@ def pseudo_legal_mask(
     king_planes = (p_kind == 0) & (ray_dist[0] == 1)
     PIECE_PLANE[6] = king_planes
     # Bishop (3): queen-like, diagonal directions (1, 3, 5, 7).
-    diag_dirs = torch.tensor([1, 3, 5, 7], device=device)
+    diag_dirs = _pin_constants_on(device)["diag_dirs"]
     is_diag = (p_kind == 0) & torch.isin(ray_dir[0], diag_dirs)
     PIECE_PLANE[3] = is_diag
     # Rook (4): queen-like, orthogonal (0, 2, 4, 6).
-    orth_dirs = torch.tensor([0, 2, 4, 6], device=device)
+    orth_dirs = _pin_constants_on(device)["orth_dirs"]
     is_orth = (p_kind == 0) & torch.isin(ray_dir[0], orth_dirs)
     PIECE_PLANE[4] = is_orth
     # Queen (5): all queen-like.
@@ -868,11 +890,10 @@ def pseudo_legal_mask(
     base = base & ~bad_push2_rank
     # Square between from and to must be empty.
     # Intermediate square = from + 1 step forward in mover-frame.
-    forward = torch.where(
-        mover_white.expand(B, 64, 1).squeeze(-1),
-        torch.full((B, 64), 8, device=device, dtype=torch.long),
-        torch.full((B, 64), -8, device=device, dtype=torch.long),
-    )  # [B, 64]
+    # forward step in board frame: +8 for white, -8 for black. Compute via
+    # arithmetic on the boolean (avoids two torch.full allocations per call).
+    mover_white_b64 = mover_white.expand(B, 64, 1).squeeze(-1)
+    forward = mover_white_b64.long() * 16 - 8  # [B, 64], 8 if white else -8
     inter_sq = (sq_idx.squeeze(-1) + forward).clamp(0, 63)  # [B, 64]
     inter_piece = pieces.gather(1, inter_sq)  # [B, 64]
     inter_empty = (inter_piece == 0).view(B, 64, 1)
@@ -1516,11 +1537,7 @@ def _insufficient_material(pieces: Tensor) -> Tensor:
     # K + B vs K + B with same-color bishops
     bishops_equal_one = (wb == 1) & (bb == 1) & (wn == 0) & (bn == 0)
     # Determine bishop square colors.
-    sq_colors = torch.tensor(
-        [((sq >> 3) + (sq & 7)) & 1 for sq in range(64)],
-        device=device,
-        dtype=torch.long,
-    )
+    sq_colors = _pin_constants_on(device)["sq_colors"]
     wb_sq = pieces == Piece.WB.value
     bb_sq = pieces == Piece.BB.value
     # Color of (only) white bishop, of (only) black bishop. Use argmax (only
@@ -1556,22 +1573,19 @@ def game_result(vs: VState) -> Tensor:
     fifty = vs.halfmove_clock.long() >= 100
     insuff = _insufficient_material(pieces)
 
+    rconst = _pin_constants_on(device)
     result = torch.full((B,), ONGOING, dtype=torch.long, device=device)
     # No legal move:
     no_move_check = ~has_move & in_check
     no_move_stale = ~has_move & ~in_check
     result = torch.where(
         no_move_check,
-        torch.where(
-            side == WHITE,
-            torch.tensor(BLACK_WIN, device=device),
-            torch.tensor(WHITE_WIN, device=device),
-        ),
+        torch.where(side == WHITE, rconst["result_black_win"], rconst["result_white_win"]),
         result,
     )
-    result = torch.where(no_move_stale, torch.tensor(DRAW, device=device), result)
+    result = torch.where(no_move_stale, rconst["result_draw"], result)
     # 50-move / insufficient material draws (only if game still ongoing AND
     # we have a legal move -- otherwise checkmate takes priority).
     draw_other = has_move & (fifty | insuff)
-    result = torch.where(draw_other, torch.tensor(DRAW, device=device), result)
+    result = torch.where(draw_other, rconst["result_draw"], result)
     return result
