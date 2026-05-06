@@ -953,25 +953,31 @@ if _HAS_TRITON:
         double_check = num_checkers >= 2
 
         # ----- Phase 4b: per-board scalar prep for castling and EP-pin -----
-        # (Hoisted out of the per-(from_sq, plane) loop so they're computed once.)
-        e1, f1c, g1c, d1c, c1c, b1c, a1c, h1c = 4, 5, 6, 3, 2, 1, 0, 7
-        e8, f8c, g8c, d8c, c8c, b8c, a8c, h8c = 60, 61, 62, 59, 58, 57, 56, 63
-        p_e1 = tl.sum(tl.where(sq == e1, pieces, 0))
-        p_h1 = tl.sum(tl.where(sq == h1c, pieces, 0))
-        p_a1 = tl.sum(tl.where(sq == a1c, pieces, 0))
-        p_f1 = tl.sum(tl.where(sq == f1c, pieces, 0))
-        p_g1 = tl.sum(tl.where(sq == g1c, pieces, 0))
-        p_d1 = tl.sum(tl.where(sq == d1c, pieces, 0))
-        p_c1 = tl.sum(tl.where(sq == c1c, pieces, 0))
-        p_b1 = tl.sum(tl.where(sq == b1c, pieces, 0))
-        p_e8 = tl.sum(tl.where(sq == e8, pieces, 0))
-        p_h8 = tl.sum(tl.where(sq == h8c, pieces, 0))
-        p_a8 = tl.sum(tl.where(sq == a8c, pieces, 0))
-        p_f8 = tl.sum(tl.where(sq == f8c, pieces, 0))
-        p_g8 = tl.sum(tl.where(sq == g8c, pieces, 0))
-        p_d8 = tl.sum(tl.where(sq == d8c, pieces, 0))
-        p_c8 = tl.sum(tl.where(sq == c8c, pieces, 0))
-        p_b8 = tl.sum(tl.where(sq == b8c, pieces, 0))
+        # Hoist occ_bb here so it's available for both castling and EP scans.
+        occ_bb = tl.sum(tl.where(pieces != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+
+        # Castling check via bitboards. Constant masks for each of 4 castle rights:
+        #   *_EMPTY: squares that must be empty (between king and rook).
+        #   *_SAFE:  squares the king must not be attacked on (incl king's start).
+        #   *_KSQ:   king's start bit / *_RSQ: rook's start bit.
+        # Then the test is: ((occ_bb & EMPTY) == 0) & ((ea_bb & SAFE) == 0)
+        #                   & ((wk_bb >> KSQ) & 1) & ((wr_bb >> RSQ) & 1).
+        # Squares: e1=4, f1=5, g1=6, d1=3, c1=2, b1=1, a1=0, h1=7;
+        #          e8=60, f8=61, g8=62, d8=59, c8=58, b8=57, a8=56, h8=63.
+        WK_EMPTY = (1 << 5) | (1 << 6)                 # f1 g1
+        WK_SAFE  = (1 << 4) | (1 << 5) | (1 << 6)      # e1 f1 g1
+        WQ_EMPTY = (1 << 1) | (1 << 2) | (1 << 3)      # b1 c1 d1
+        WQ_SAFE  = (1 << 2) | (1 << 3) | (1 << 4)      # c1 d1 e1
+        BK_EMPTY = (1 << 61) | (1 << 62)               # f8 g8
+        BK_SAFE  = (1 << 60) | (1 << 61) | (1 << 62)   # e8 f8 g8
+        BQ_EMPTY = (1 << 57) | (1 << 58) | (1 << 59)   # b8 c8 d8
+        BQ_SAFE  = (1 << 58) | (1 << 59) | (1 << 60)   # c8 d8 e8
+
+        # Piece-type bitboards (white king/rook, black king/rook).
+        wk_bb = tl.sum(tl.where(pieces == 6,  bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+        wr_bb = tl.sum(tl.where(pieces == 4,  bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+        bk_bb = tl.sum(tl.where(pieces == 12, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+        br_bb = tl.sum(tl.where(pieces == 10, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
 
         side_white = is_white_mover
         side_black = ~is_white_mover
@@ -982,32 +988,28 @@ if _HAS_TRITON:
 
         wk_ok = (
             side_white & cr_wk
-            & (p_e1 == 6) & (p_h1 == 4) & (p_f1 == 0) & (p_g1 == 0)
-            & (((ea_bb >> e1) & 1) == 0)
-            & (((ea_bb >> f1c) & 1) == 0)
-            & (((ea_bb >> g1c) & 1) == 0)
+            & (((wk_bb >> 4) & 1) != 0) & (((wr_bb >> 7) & 1) != 0)
+            & ((occ_bb & WK_EMPTY) == 0) & ((ea_bb & WK_SAFE) == 0)
         )
         wq_ok = (
             side_white & cr_wq
-            & (p_e1 == 6) & (p_a1 == 4) & (p_d1 == 0) & (p_c1 == 0) & (p_b1 == 0)
-            & (((ea_bb >> e1) & 1) == 0)
-            & (((ea_bb >> d1c) & 1) == 0)
-            & (((ea_bb >> c1c) & 1) == 0)
+            & (((wk_bb >> 4) & 1) != 0) & (((wr_bb >> 0) & 1) != 0)
+            & ((occ_bb & WQ_EMPTY) == 0) & ((ea_bb & WQ_SAFE) == 0)
         )
         bk_ok = (
             side_black & cr_bk
-            & (p_e8 == 12) & (p_h8 == 10) & (p_f8 == 0) & (p_g8 == 0)
-            & (((ea_bb >> e8) & 1) == 0)
-            & (((ea_bb >> f8c) & 1) == 0)
-            & (((ea_bb >> g8c) & 1) == 0)
+            & (((bk_bb >> 60) & 1) != 0) & (((br_bb >> 63) & 1) != 0)
+            & ((occ_bb & BK_EMPTY) == 0) & ((ea_bb & BK_SAFE) == 0)
         )
         bq_ok = (
             side_black & cr_bq
-            & (p_e8 == 12) & (p_a8 == 10) & (p_d8 == 0) & (p_c8 == 0) & (p_b8 == 0)
-            & (((ea_bb >> e8) & 1) == 0)
-            & (((ea_bb >> d8c) & 1) == 0)
-            & (((ea_bb >> c8c) & 1) == 0)
+            & (((bk_bb >> 60) & 1) != 0) & (((br_bb >> 56) & 1) != 0)
+            & ((occ_bb & BQ_EMPTY) == 0) & ((ea_bb & BQ_SAFE) == 0)
         )
+
+        # Square indices used elsewhere (EP-pin code below).
+        e1, f1c, g1c, d1c, c1c, b1c, a1c, h1c = 4, 5, 6, 3, 2, 1, 0, 7
+        e8, f8c, g8c, d8c, c8c, b8c, a8c, h8c = 60, 61, 62, 59, 58, 57, 56, 63
 
         # ---- EP horizontal-pin: per-from ep_unsafe[64] (state-dependent) ----
         ep_valid = ep >= 0
@@ -1087,9 +1089,6 @@ if _HAS_TRITON:
         pin_movable_hi_per = tl.load(PIN_MOVABLE_BB_ptr + pin_base + pin_idx * 2 + 1)
 
         ep_unsafe_b = ep_unsafe_per_from[:, None]
-
-        # Occupancy bitboard (used inside chunk loop for slider blocker).
-        occ_bb = tl.sum(tl.where(pieces != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
 
         # Side offset for the [2, 64, PAD] tables (between_bb, real_to_tbl).
         side_off = tl.where(is_white_mover, 0, 64 * BLOCK_PL)
