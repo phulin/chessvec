@@ -757,26 +757,34 @@ if _HAS_TRITON:
         DRS_C = [1, 1, 0, -1, -1, -1, 0, 1]
         ORTH_C = [True, False, True, False, True, False, True, False]
 
+        # Vectorize across the 7 ray steps: per direction, build a [64, 8] tile
+        # of target pieces (8 = next pow2 above 7; lane 0 is treated as a
+        # no-op step). Replaces 7 separate gathers per direction.
+        step_arr = tl.arange(0, 8)[None, :]                     # [1, 8] step 0..7
+        valid_step = step_arr >= 1                              # [1, 8]
         for d_idx in tl.static_range(0, 8):
             df_d = DFS_C[d_idx]
             dr_d = DRS_C[d_idx]
             is_orth = ORTH_C[d_idx]
-            walking = tl.full([BLOCK_SQ], 1, tl.int32)
-            for step in tl.static_range(1, 8):
-                tf = file_sq + df_d * step
-                tr = rank_sq + dr_d * step
-                on_b = ((tf >= 0) & (tf < 8) & (tr >= 0) & (tr < 8)).to(tl.int32)
-                tsq = tl.where(on_b > 0, tr * 8 + tf, 0)
-                tp = tl.gather(pieces_nk, tsq, axis=0)
-                tp = tl.where(on_b > 0, tp, 0)
-                is_piece = (tp != 0).to(tl.int32)
-                first_p = walking * is_piece
-                if is_orth:
-                    matches = ((tp == rook_code) | (tp == queen_code)).to(tl.int32)
-                else:
-                    matches = ((tp == bishop_code) | (tp == queen_code)).to(tl.int32)
-                slider_atk = slider_atk | (first_p * matches)
-                walking = walking * (1 - is_piece) * on_b
+            tf = file_sq[:, None] + df_d * step_arr             # [64, 8]
+            tr = rank_sq[:, None] + dr_d * step_arr             # [64, 8]
+            on_b = ((tf >= 0) & (tf < 8) & (tr >= 0) & (tr < 8) & valid_step)
+            tsq = tl.where(on_b, tr * 8 + tf, 0)                # [64, 8]
+            tp = tl.gather(
+                pieces_nk[:, None] + tl.zeros([BLOCK_SQ, 8], tl.int32),  # [64, 8] broadcast
+                tsq, axis=0
+            )
+            tp = tl.where(on_b, tp, 0)
+            is_piece = (tp != 0).to(tl.int32)
+            cum = tl.cumsum(is_piece, axis=1)                   # [64, 8]
+            first_step_mask = (cum == 1) & (is_piece == 1)
+            if is_orth:
+                is_match = (tp == rook_code) | (tp == queen_code)
+            else:
+                is_match = (tp == bishop_code) | (tp == queen_code)
+            contrib = (first_step_mask & is_match).to(tl.int32).sum(axis=1)
+            contrib = (contrib > 0).to(tl.int32)
+            slider_atk = slider_atk | contrib
 
         enemy_attacks = (knight_atk | king_atk | pawn_atk | slider_atk)  # [64] int32 0/1
         # Pack into a u64 bitboard (scalar). bit_per_sq used here and later.
@@ -1260,7 +1268,7 @@ def triton_legal_action_mask(vs: VState) -> Tensor:
         BB_PLANE_VALID_HI=bb["plane_valid"][1],
         BLOCK_SQ=64, BLOCK_PL=_PADDED_PLANES, BLOCK_PL_CHUNK=64,
         NUM_PL=NUM_MOVE_PLANES,
-        num_warps=4,
+        num_warps=1,
     )
     return out[:, :, :NUM_MOVE_PLANES].reshape(B, ACTION_SIZE).to(torch.bool)
 
