@@ -421,6 +421,7 @@ def triton_step(vs: VState, action: Tensor) -> VState:
         pr_t,
         BLOCK_SQ=64,
         NUM_PLANES_C=NUM_MOVE_PLANES,
+        num_warps=2,
     )
 
     return VState(
@@ -1268,7 +1269,7 @@ def triton_legal_action_mask(vs: VState) -> Tensor:
         BB_PLANE_VALID_HI=bb["plane_valid"][1],
         BLOCK_SQ=64, BLOCK_PL=_PADDED_PLANES, BLOCK_PL_CHUNK=64,
         NUM_PL=NUM_MOVE_PLANES,
-        num_warps=1,
+        num_warps=2,
     )
     return out[:, :, :NUM_MOVE_PLANES].reshape(B, ACTION_SIZE).to(torch.bool)
 
@@ -1892,6 +1893,6 @@ def triton_rollout(
         BB_PLANE_VALID_HI=bb["plane_valid"][1],
         BLOCK_SQ=64, BLOCK_PL=_PADDED_PLANES, BLOCK_PL_CHUNK=64,
         NUM_PL=NUM_MOVE_PLANES,
-        num_warps=1,
+        num_warps=2,
     )
     return root_action, leaf_value
