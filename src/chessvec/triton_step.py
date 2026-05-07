@@ -1898,5 +1898,6 @@ def triton_rollout(
         BLOCK_SQ=64, BLOCK_PL=_PADDED_PLANES, BLOCK_PL_CHUNK=32,
         NUM_PL=NUM_MOVE_PLANES,
         num_warps=2,
+        maxnreg=96,
     )
     return root_action, leaf_value
