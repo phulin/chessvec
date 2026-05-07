@@ -44,10 +44,11 @@ from chessvec.vectorized import (
 )
 
 try:
-    from chessvec.triton_step import _HAS_TRITON, triton_step
+    from chessvec.triton_step import _HAS_TRITON, triton_rollout, triton_step
 except ImportError:  # pragma: no cover
     _HAS_TRITON = False
     triton_step = None  # type: ignore[assignment]
+    triton_rollout = None  # type: ignore[assignment]
 
 
 POSITIONS: dict[str, str] = {
@@ -255,6 +256,21 @@ def main() -> None:
                     sps = B / elapsed
                     plies_s = B * args.depth / elapsed
                     tag = f"triton[{device.type}] B={B}"
+                    print(
+                        f"{name:<14} {tag:<22} {sps:>12,.1f} {plies_s:>14,.0f} {elapsed:>10.3f}"
+                    )
+
+                    # Persistent fused-rollout kernel.
+                    initial = from_states([state] * B, device=device)
+                    triton_rollout(initial, depth=args.depth, seed=0)  # warmup
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    triton_rollout(initial, depth=args.depth, seed=1)
+                    torch.cuda.synchronize()
+                    elapsed = time.perf_counter() - t0
+                    sps = B / elapsed
+                    plies_s = B * args.depth / elapsed
+                    tag = f"fused[{device.type}] B={B}"
                     print(
                         f"{name:<14} {tag:<22} {sps:>12,.1f} {plies_s:>14,.0f} {elapsed:>10.3f}"
                     )

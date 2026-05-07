@@ -33,6 +33,104 @@ except ImportError:  # pragma: no cover - optional dep
 if _HAS_TRITON:
 
     @triton.jit
+    def _step_body(
+        pieces,    # int32 [BLOCK_SQ]
+        side,      # int32 scalar
+        cr,        # int32 scalar
+        ep,        # int32 scalar
+        hmc,       # int32 scalar
+        fmn,       # int32 scalar
+        action,    # int32 scalar
+        df_table_ptr,
+        dr_table_ptr,
+        kind_table_ptr,
+        promo_table_ptr,
+        BLOCK_SQ: tl.constexpr,
+        NUM_PLANES_C: tl.constexpr,
+    ):
+        """Apply one action to a single VState held in registers.
+
+        Returns (new_pieces[BLOCK_SQ] int32, new_side, new_cr, new_ep, new_hmc, new_fmn)
+        as scalars (with new_pieces a tile).
+        """
+        sq = tl.arange(0, BLOCK_SQ)
+
+        from_sq = action // NUM_PLANES_C
+        plane = action % NUM_PLANES_C
+        tbl_idx = from_sq * NUM_PLANES_C + plane
+        df = tl.load(df_table_ptr + tbl_idx).to(tl.int32)
+        dr = tl.load(dr_table_ptr + tbl_idx).to(tl.int32)
+        kind_v = tl.load(kind_table_ptr + tbl_idx).to(tl.int32)
+        promo = tl.load(promo_table_ptr + tbl_idx).to(tl.int32)
+
+        is_white = side == 0
+        dr_signed = tl.where(is_white, dr, -dr)
+        f0 = from_sq & 7
+        r0 = from_sq // 8
+        f1 = f0 + df
+        r1 = r0 + dr_signed
+        to_sq = r1 * 8 + f1
+
+        moving_piece = tl.sum(tl.where(sq == from_sq, pieces, 0))
+        captured_piece = tl.sum(tl.where(sq == to_sq, pieces, 0))
+        pt = tl.where(moving_piece >= 7, moving_piece - 6, moving_piece)
+
+        is_pawn = pt == 1
+        is_king = pt == 6
+
+        is_ep_capture = is_pawn & (to_sq == ep) & (captured_piece == 0) & (ep >= 0)
+        ep_cap_sq = tl.where(is_white, to_sq - 8, to_sq + 8)
+
+        to_rank_mover = tl.where(is_white, to_sq // 8, 7 - (to_sq // 8))
+        is_promotion = is_pawn & (to_rank_mover == 7)
+        promo_pt = tl.where(kind_v == 2, promo, 5)
+        promoted_piece = tl.where(is_white, promo_pt, promo_pt + 6)
+        new_piece = tl.where(is_promotion, promoted_piece, moving_piece)
+
+        is_castle = is_king & ((df == 2) | (df == -2))
+        castle_ks = is_castle & (df == 2)
+        rank_b = from_sq // 8
+        rook_from = tl.where(castle_ks, rank_b * 8 + 7, rank_b * 8 + 0)
+        rook_to = tl.where(castle_ks, rank_b * 8 + 5, rank_b * 8 + 3)
+        rook_piece = tl.where(is_white, 4, 10)
+
+        new_pieces = pieces
+        new_pieces = tl.where(is_ep_capture & (sq == ep_cap_sq), 0, new_pieces)
+        new_pieces = tl.where(sq == from_sq, 0, new_pieces)
+        new_pieces = tl.where(sq == to_sq, new_piece, new_pieces)
+        new_pieces = tl.where(is_castle & (sq == rook_from), 0, new_pieces)
+        new_pieces = tl.where(is_castle & (sq == rook_to), rook_piece, new_pieces)
+
+        new_cr = cr
+        wk_moved = is_king & is_white
+        bk_moved = is_king & (~is_white)
+        new_cr = tl.where(wk_moved, new_cr & ~0x3, new_cr)
+        new_cr = tl.where(bk_moved, new_cr & ~0xC, new_cr)
+        aff_a1 = (from_sq == 0) | (to_sq == 0)
+        aff_h1 = (from_sq == 7) | (to_sq == 7)
+        aff_a8 = (from_sq == 56) | (to_sq == 56)
+        aff_h8 = (from_sq == 63) | (to_sq == 63)
+        new_cr = tl.where(aff_a1, new_cr & ~0x2, new_cr)
+        new_cr = tl.where(aff_h1, new_cr & ~0x1, new_cr)
+        new_cr = tl.where(aff_a8, new_cr & ~0x8, new_cr)
+        new_cr = tl.where(aff_h8, new_cr & ~0x4, new_cr)
+
+        is_double_push = is_pawn & (df == 0) & (dr == 2)
+        new_ep = tl.where(
+            is_double_push,
+            tl.where(is_white, to_sq - 8, to_sq + 8),
+            -1,
+        )
+
+        is_capture = (captured_piece != 0) | is_ep_capture
+        new_hmc = tl.where(is_pawn | is_capture, 0, hmc + 1)
+        new_fmn = tl.where(is_white, fmn, fmn + 1)
+        new_side = 1 - side
+
+        return new_pieces, new_side, new_cr, new_ep, new_hmc, new_fmn
+
+
+    @triton.jit
     def _step_kernel(
         pieces_ptr,  # int8 [B, 64]
         side_ptr,  # int8 [B]
@@ -66,96 +164,13 @@ if _HAS_TRITON:
         fmn = tl.load(fmn_ptr + pid).to(tl.int32)
         action = tl.load(action_ptr + pid).to(tl.int32)
 
-        from_sq = action // NUM_PLANES_C
-        plane = action % NUM_PLANES_C
-        tbl_idx = from_sq * NUM_PLANES_C + plane
-        df = tl.load(df_table_ptr + tbl_idx).to(tl.int32)
-        dr = tl.load(dr_table_ptr + tbl_idx).to(tl.int32)
-        kind_v = tl.load(kind_table_ptr + tbl_idx).to(tl.int32)
-        promo = tl.load(promo_table_ptr + tbl_idx).to(tl.int32)
-
-        # ----- Geometry -----
-        is_white = side == 0
-        dr_signed = tl.where(is_white, dr, -dr)
-        f0 = from_sq & 7
-        r0 = from_sq // 8
-        f1 = f0 + df
-        r1 = r0 + dr_signed
-        to_sq = r1 * 8 + f1
-
-        # Per-env scalars from the [64]-vector via masked sum.
-        moving_piece = tl.sum(tl.where(sq == from_sq, pieces, 0))
-        captured_piece = tl.sum(tl.where(sq == to_sq, pieces, 0))
-        pt = tl.where(moving_piece >= 7, moving_piece - 6, moving_piece)
-
-        is_pawn = pt == 1
-        is_king = pt == 6
-
-        # En passant capture detection (pawn moves to ep with empty target).
-        is_ep_capture = is_pawn & (to_sq == ep) & (captured_piece == 0) & (ep >= 0)
-        ep_cap_sq = tl.where(is_white, to_sq - 8, to_sq + 8)
-
-        # Promotion (queen by default for queen-like, else underpromo piece).
-        to_rank_mover = tl.where(is_white, to_sq // 8, 7 - (to_sq // 8))
-        is_promotion = is_pawn & (to_rank_mover == 7)
-        promo_pt = tl.where(kind_v == 2, promo, 5)
-        promoted_piece = tl.where(is_white, promo_pt, promo_pt + 6)
-        new_piece = tl.where(is_promotion, promoted_piece, moving_piece)
-
-        # Castling: relocate the rook.
-        is_castle = is_king & ((df == 2) | (df == -2))
-        castle_ks = is_castle & (df == 2)
-        rank_b = from_sq // 8
-        rook_from = tl.where(castle_ks, rank_b * 8 + 7, rank_b * 8 + 0)
-        rook_to = tl.where(castle_ks, rank_b * 8 + 5, rank_b * 8 + 3)
-        rook_piece = tl.where(is_white, 4, 10)  # WR or BR
-
-        # ----- Build new pieces vector -----
-        new_pieces = pieces
-        # En-passant: clear the captured pawn's square.
-        new_pieces = tl.where(is_ep_capture & (sq == ep_cap_sq), 0, new_pieces)
-        # Clear from-sq.
-        new_pieces = tl.where(sq == from_sq, 0, new_pieces)
-        # Set to-sq with possibly-promoted piece.
-        new_pieces = tl.where(sq == to_sq, new_piece, new_pieces)
-        # Castling rook.
-        new_pieces = tl.where(is_castle & (sq == rook_from), 0, new_pieces)
-        new_pieces = tl.where(is_castle & (sq == rook_to), rook_piece, new_pieces)
-
-        tl.store(out_pieces_ptr + pid * BLOCK_SQ + sq, new_pieces.to(tl.int8))
-
-        # ----- Castling rights -----
-        new_cr = cr
-        wk_moved = is_king & is_white
-        bk_moved = is_king & (~is_white)
-        # Bits: 0=WK, 1=WQ, 2=BK, 3=BQ
-        new_cr = tl.where(wk_moved, new_cr & ~0x3, new_cr)
-        new_cr = tl.where(bk_moved, new_cr & ~0xC, new_cr)
-        # Rook moved off / captured on starting square.
-        # a1=0 -> WQ (bit1), h1=7 -> WK (bit0), a8=56 -> BQ (bit3), h8=63 -> BK (bit2).
-        aff_a1 = (from_sq == 0) | (to_sq == 0)
-        aff_h1 = (from_sq == 7) | (to_sq == 7)
-        aff_a8 = (from_sq == 56) | (to_sq == 56)
-        aff_h8 = (from_sq == 63) | (to_sq == 63)
-        new_cr = tl.where(aff_a1, new_cr & ~0x2, new_cr)
-        new_cr = tl.where(aff_h1, new_cr & ~0x1, new_cr)
-        new_cr = tl.where(aff_a8, new_cr & ~0x8, new_cr)
-        new_cr = tl.where(aff_h8, new_cr & ~0x4, new_cr)
-
-        # ----- En passant target -----
-        is_double_push = is_pawn & (df == 0) & (dr == 2)
-        new_ep = tl.where(
-            is_double_push,
-            tl.where(is_white, to_sq - 8, to_sq + 8),
-            -1,
+        new_pieces, new_side, new_cr, new_ep, new_hmc, new_fmn = _step_body(
+            pieces, side, cr, ep, hmc, fmn, action,
+            df_table_ptr, dr_table_ptr, kind_table_ptr, promo_table_ptr,
+            BLOCK_SQ=BLOCK_SQ, NUM_PLANES_C=NUM_PLANES_C,
         )
 
-        # ----- Halfmove clock / fullmove / side -----
-        is_capture = (captured_piece != 0) | is_ep_capture
-        new_hmc = tl.where(is_pawn | is_capture, 0, hmc + 1)
-        new_fmn = tl.where(is_white, fmn, fmn + 1)
-        new_side = 1 - side
-
+        tl.store(out_pieces_ptr + pid * BLOCK_SQ + sq, new_pieces.to(tl.int8))
         tl.store(out_side_ptr + pid, new_side.to(tl.int8))
         tl.store(out_cr_ptr + pid, new_cr.to(tl.int8))
         tl.store(out_ep_ptr + pid, new_ep.to(tl.int8))
@@ -1271,3 +1286,612 @@ def triton_slider_blockers(pieces: Tensor) -> Tensor:
     out = torch.empty(B, 64, 8, 7, dtype=torch.uint8, device=pieces.device)
     _slider_blockers_kernel[(B,)](pieces.contiguous(), out, BLOCK_SQ=64)
     return out.to(torch.bool)
+
+
+# ---------------------------------------------------------------------------
+# Persistent rollout kernel: one program per env runs the entire `depth`-ply
+# random-rollout loop in registers. Per ply: inline legal-mask (Phase 1-7),
+# reservoir-sample one uniform legal action per chunk via tl.rand-tagged
+# argmin, terminal/leaf-value bookkeeping, then inline step apply gated by a
+# per-program `done` flag. Outputs root_action[B] (action sampled at ply 0)
+# and leaf_value[B] (root-POV +1/0/-1 if a terminal was hit, else 0).
+# ---------------------------------------------------------------------------
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _rollout_kernel(
+        pieces_in_ptr,   # int8  [B, 64]
+        side_in_ptr,     # int8  [B]
+        cr_in_ptr,       # int8  [B]
+        ep_in_ptr,       # int8  [B]
+        hmc_in_ptr,      # int16 [B]
+        fmn_in_ptr,      # int16 [B]
+        root_action_ptr, # int64 [B]
+        leaf_value_ptr,  # float32 [B]
+        # legal-mask tables (same layout/order as _legal_mask_kernel)
+        df_tbl_ptr, dr_tbl_ptr, kind_tbl_ptr,
+        ray_dir_tbl_ptr, ray_dist_tbl_ptr, promo_tbl_ptr,
+        KNIGHT_TBL_ptr, KING_TBL_ptr, WPAWN_TBL_ptr, BPAWN_TBL_ptr,
+        KNIGHT_BB_ptr, KING_BB_ptr, WPAWN_BB_ptr, BPAWN_BB_ptr,
+        BETWEEN_BB_ptr,
+        PLANE_ALLOWED_BB_ptr, PIN_MOVABLE_BB_ptr, ON_BOARD_BB_ptr,
+        REAL_TO_TBL_ptr,
+        # step tables (flat [64*73] int64) for _step_body
+        STEP_DF_ptr, STEP_DR_ptr, STEP_KIND_ptr, STEP_PROMO_ptr,
+        depth_runtime,           # int — runtime loop trip count
+        seed_runtime,            # int — seeds tl.rand at runtime
+        BB_IS_Q_LO: tl.constexpr,   BB_IS_Q_HI: tl.constexpr,
+        BB_IS_U_LO: tl.constexpr,   BB_IS_U_HI: tl.constexpr,
+        BB_IS_CASTLE_LO: tl.constexpr, BB_IS_CASTLE_HI: tl.constexpr,
+        BB_PUSH_LO: tl.constexpr,   BB_PUSH_HI: tl.constexpr,
+        BB_CAP_LO: tl.constexpr,    BB_CAP_HI: tl.constexpr,
+        BB_PUSH1_LO: tl.constexpr,  BB_PUSH1_HI: tl.constexpr,
+        BB_PUSH2_LO: tl.constexpr,  BB_PUSH2_HI: tl.constexpr,
+        BB_UNDERPROMO_PUSH_LO: tl.constexpr, BB_UNDERPROMO_PUSH_HI: tl.constexpr,
+        BB_PLANE_VALID_LO: tl.constexpr, BB_PLANE_VALID_HI: tl.constexpr,
+        BLOCK_SQ: tl.constexpr,    # 64
+        BLOCK_PL: tl.constexpr,    # 128
+        BLOCK_PL_CHUNK: tl.constexpr,  # 64
+        NUM_PL: tl.constexpr,      # 73
+    ):
+        pid = tl.program_id(axis=0)
+        sq = tl.arange(0, BLOCK_SQ)
+
+        # Initial state -> registers.
+        pieces = tl.load(pieces_in_ptr + pid * BLOCK_SQ + sq).to(tl.int32)
+        side = tl.load(side_in_ptr + pid).to(tl.int32)
+        cr = tl.load(cr_in_ptr + pid).to(tl.int32)
+        ep = tl.load(ep_in_ptr + pid).to(tl.int32)
+        hmc = tl.load(hmc_in_ptr + pid).to(tl.int32)
+        fmn = tl.load(fmn_in_ptr + pid).to(tl.int32)
+
+        root_player = side  # captured before any apply (uniform per program)
+        leaf_value = 0.0
+        done = False
+        root_action = 0
+
+        # Direction tables for slider/ray walks (compile-time).
+        DFS_C = [0, 1, 1, 1, 0, -1, -1, -1]
+        DRS_C = [1, 1, 0, -1, -1, -1, 0, 1]
+        ORTH_C = [True, False, True, False, True, False, True, False]
+
+        # Castling planes (for re-enable in chunk 0).
+        PLANE_CE = 2 * 7 + 1   # 15
+        PLANE_CW = 6 * 7 + 1   # 43
+
+        # Per-program random offset budget.
+        # offsets_per_ply = 2 chunks * 64 sq * 64 plane = 8192
+        OFF_PER_PLY = 8192
+
+        for d in range(depth_runtime):
+            base_off_ply = (pid.to(tl.int64) * (depth_runtime * OFF_PER_PLY)
+                            + d.to(tl.int64) * OFF_PER_PLY)
+
+            # ===================================================================
+            # Phase 1: scalars derived from current registers.
+            # ===================================================================
+            is_white_mover = side == 0
+
+            king_code = tl.where(is_white_mover, 6, 12)
+            king_mask_v = (pieces == king_code).to(tl.int32)
+            king_sq = tl.sum(sq * king_mask_v)
+            king_file = king_sq & 7
+            king_rank = king_sq >> 3
+
+            # ===================================================================
+            # Phase 2: enemy attacks with mover king removed.
+            # ===================================================================
+            pieces_nk = tl.where(pieces == king_code, 0, pieces)
+            pawn_code = tl.where(is_white_mover, 7, 1)
+            knight_code = tl.where(is_white_mover, 8, 2)
+            bishop_code = tl.where(is_white_mover, 9, 3)
+            rook_code = tl.where(is_white_mover, 10, 4)
+            queen_code = tl.where(is_white_mover, 11, 5)
+            enemy_king_code = tl.where(is_white_mover, 12, 6)
+            own_king_code = tl.where(is_white_mover, 6, 12)
+
+            KNIGHT_BB = tl.load(KNIGHT_BB_ptr + sq)
+            KING_BB = tl.load(KING_BB_ptr + sq)
+            WP_BB = tl.load(WPAWN_BB_ptr + sq)
+            BP_BB = tl.load(BPAWN_BB_ptr + sq)
+            PAWN_BB = tl.where(is_white_mover, BP_BB, WP_BB)
+
+            enemy_pawn_v = pieces_nk == pawn_code
+            enemy_knight_v = pieces_nk == knight_code
+            enemy_king_v = pieces_nk == enemy_king_code
+
+            zero64 = tl.zeros([BLOCK_SQ], tl.int64)
+            knight_atk_bb = tl.reduce_or(
+                tl.where(enemy_knight_v, KNIGHT_BB, zero64), axis=0
+            )
+            king_atk_bb = tl.reduce_or(
+                tl.where(enemy_king_v, KING_BB, zero64), axis=0
+            )
+            pawn_atk_bb = tl.reduce_or(
+                tl.where(enemy_pawn_v, PAWN_BB, zero64), axis=0
+            )
+
+            file_sq = sq & 7
+            rank_sq = sq >> 3
+            slider_atk = tl.zeros([BLOCK_SQ], tl.int32)
+
+            step_arr = tl.arange(0, 8)[None, :]
+            valid_step = step_arr >= 1
+            for d_idx in tl.static_range(0, 8):
+                df_d = DFS_C[d_idx]
+                dr_d = DRS_C[d_idx]
+                is_orth = ORTH_C[d_idx]
+                tf = file_sq[:, None] + df_d * step_arr
+                tr = rank_sq[:, None] + dr_d * step_arr
+                on_b = ((tf >= 0) & (tf < 8) & (tr >= 0) & (tr < 8) & valid_step)
+                tsq = tl.where(on_b, tr * 8 + tf, 0)
+                tp = tl.gather(
+                    pieces_nk[:, None] + tl.zeros([BLOCK_SQ, 8], tl.int32),
+                    tsq, axis=0
+                )
+                tp = tl.where(on_b, tp, 0)
+                is_piece = (tp != 0).to(tl.int32)
+                cum = tl.cumsum(is_piece, axis=1)
+                first_step_mask = (cum == 1) & (is_piece == 1)
+                if is_orth:
+                    is_match = (tp == rook_code) | (tp == queen_code)
+                else:
+                    is_match = (tp == bishop_code) | (tp == queen_code)
+                contrib = (first_step_mask & is_match).to(tl.int32).sum(axis=1)
+                contrib = (contrib > 0).to(tl.int32)
+                slider_atk = slider_atk | contrib
+
+            bit_per_sq = (tl.full([1], 1, tl.int64) << sq.to(tl.int64)).to(tl.int64)
+            slider_atk_bb = tl.sum(
+                tl.where(slider_atk != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64))
+            )
+            ea_bb = knight_atk_bb | king_atk_bb | pawn_atk_bb | slider_atk_bb
+
+            # ===================================================================
+            # Phase 3: ray analysis from king (boc_bb, pin descriptors, checkers).
+            # ===================================================================
+            pin_df_per_from = tl.full([BLOCK_SQ], 99, tl.int32)
+            pin_dr_per_from = tl.full([BLOCK_SQ], 99, tl.int32)
+            boc_bb = tl.zeros([], tl.int64)
+            num_checkers_slider = 0
+
+            step8 = tl.arange(0, 8)
+            one64_8 = tl.full([8], 1, tl.int64)
+            for d_idx in tl.static_range(0, 8):
+                df_d = DFS_C[d_idx]
+                dr_d = DRS_C[d_idx]
+                is_orth = ORTH_C[d_idx]
+
+                tf = king_file + df_d * step8
+                tr = king_rank + dr_d * step8
+                on_b = ((tf >= 0) & (tf < 8) & (tr >= 0) & (tr < 8) & (step8 >= 1))
+                tsq = tl.where(on_b, tr * 8 + tf, 0)
+                tp = tl.gather(pieces, tsq, axis=0)
+                tp = tl.where(on_b, tp, 0)
+                is_piece = tp != 0
+                cum = tl.cumsum(is_piece.to(tl.int32), axis=0)
+                first_mask = (cum == 1) & is_piece
+                second_mask = (cum == 2) & is_piece
+                first_p = tl.sum(tl.where(first_mask, tp, 0))
+                first_sq = tl.sum(tl.where(first_mask, tsq, 0))
+                second_p = tl.sum(tl.where(second_mask, tp, 0))
+                has_first = tl.sum(first_mask.to(tl.int32)) > 0
+                has_second = tl.sum(second_mask.to(tl.int32)) > 0
+
+                first_is_white = (first_p >= 1) & (first_p <= 6)
+                first_is_black = (first_p >= 7) & (first_p <= 12)
+                first_is_own = tl.where(is_white_mover, first_is_white, first_is_black)
+                first_is_enemy = tl.where(is_white_mover, first_is_black, first_is_white)
+                second_is_white = (second_p >= 1) & (second_p <= 6)
+                second_is_black = (second_p >= 7) & (second_p <= 12)
+                second_is_enemy = tl.where(is_white_mover, second_is_black, second_is_white)
+
+                if is_orth:
+                    first_is_enemy_slider = first_is_enemy & ((first_p == rook_code) | (first_p == queen_code))
+                    second_is_enemy_slider = second_is_enemy & ((second_p == rook_code) | (second_p == queen_code))
+                else:
+                    first_is_enemy_slider = first_is_enemy & ((first_p == bishop_code) | (first_p == queen_code))
+                    second_is_enemy_slider = second_is_enemy & ((second_p == bishop_code) | (second_p == queen_code))
+
+                is_check_ray = first_is_enemy_slider & has_first
+                is_pin_ray = first_is_own & second_is_enemy_slider & has_second
+                num_checkers_slider = num_checkers_slider + tl.where(is_check_ray, 1, 0)
+
+                in_seg = (cum <= 1) & on_b
+                ray_bb = tl.sum(tl.where(in_seg, one64_8 << tsq.to(tl.int64), tl.zeros([8], tl.int64)))
+                boc_bb = boc_bb | tl.where(is_check_ray, ray_bb, tl.zeros([], tl.int64))
+
+                df_unit_d = (1 if df_d > 0 else (-1 if df_d < 0 else 0))
+                dr_unit_d = (1 if dr_d > 0 else (-1 if dr_d < 0 else 0))
+                pin_match_lane = (sq == first_sq) & is_pin_ray
+                pin_df_per_from = tl.where(pin_match_lane, df_unit_d, pin_df_per_from)
+                pin_dr_per_from = tl.where(pin_match_lane, dr_unit_d, pin_dr_per_from)
+
+            # Knight + pawn checkers.
+            knight_atks_to_king_bb = tl.load(KNIGHT_BB_ptr + king_sq)
+            wp_at_king_bb = tl.load(WPAWN_BB_ptr + king_sq)
+            bp_at_king_bb = tl.load(BPAWN_BB_ptr + king_sq)
+            pawn_atks_to_king_bb = tl.where(is_white_mover, wp_at_king_bb, bp_at_king_bb)
+            enemy_knight_bb = tl.sum(
+                tl.where(pieces == knight_code, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64))
+            )
+            enemy_pawn_bb = tl.sum(
+                tl.where(pieces == pawn_code, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64))
+            )
+            knight_check_bb = knight_atks_to_king_bb & enemy_knight_bb
+            pawn_check_bb = pawn_atks_to_king_bb & enemy_pawn_bb
+            knight_checkers = (((knight_atks_to_king_bb >> sq.to(tl.int64)) & 1)
+                               & (pieces == knight_code).to(tl.int64)).to(tl.int32)
+            pawn_checkers = (((pawn_atks_to_king_bb >> sq.to(tl.int64)) & 1)
+                             & (pieces == pawn_code).to(tl.int64)).to(tl.int32)
+
+            boc_bb = boc_bb | knight_check_bb | pawn_check_bb
+            num_checkers = (
+                num_checkers_slider
+                + tl.sum(knight_checkers)
+                + tl.sum(pawn_checkers)
+            )
+            in_check = num_checkers >= 1
+            double_check = num_checkers >= 2
+
+            # ===================================================================
+            # Phase 4: occ/enemy bb, castling, EP-pin scan.
+            # ===================================================================
+            occ_bb = tl.sum(tl.where(pieces != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+            is_enemy_v = tl.where(
+                is_white_mover,
+                (pieces >= 7) & (pieces <= 12),
+                (pieces >= 1) & (pieces <= 6),
+            )
+            enemy_bb = tl.sum(tl.where(is_enemy_v, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+
+            WK_EMPTY = (1 << 5) | (1 << 6)
+            WK_SAFE  = (1 << 4) | (1 << 5) | (1 << 6)
+            WQ_EMPTY = (1 << 1) | (1 << 2) | (1 << 3)
+            WQ_SAFE  = (1 << 2) | (1 << 3) | (1 << 4)
+            BK_EMPTY = (1 << 61) | (1 << 62)
+            BK_SAFE  = (1 << 60) | (1 << 61) | (1 << 62)
+            BQ_EMPTY = (1 << 57) | (1 << 58) | (1 << 59)
+            BQ_SAFE  = (1 << 58) | (1 << 59) | (1 << 60)
+
+            wk_bb = tl.sum(tl.where(pieces == 6,  bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+            wr_bb = tl.sum(tl.where(pieces == 4,  bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+            bk_bb = tl.sum(tl.where(pieces == 12, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+            br_bb = tl.sum(tl.where(pieces == 10, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+
+            side_white = is_white_mover
+            side_black = ~is_white_mover
+            cr_wk = (cr & 1) != 0
+            cr_wq = ((cr >> 1) & 1) != 0
+            cr_bk = ((cr >> 2) & 1) != 0
+            cr_bq = ((cr >> 3) & 1) != 0
+
+            wk_ok = (
+                side_white & cr_wk
+                & (((wk_bb >> 4) & 1) != 0) & (((wr_bb >> 7) & 1) != 0)
+                & ((occ_bb & WK_EMPTY) == 0) & ((ea_bb & WK_SAFE) == 0)
+            )
+            wq_ok = (
+                side_white & cr_wq
+                & (((wk_bb >> 4) & 1) != 0) & (((wr_bb >> 0) & 1) != 0)
+                & ((occ_bb & WQ_EMPTY) == 0) & ((ea_bb & WQ_SAFE) == 0)
+            )
+            bk_ok = (
+                side_black & cr_bk
+                & (((bk_bb >> 60) & 1) != 0) & (((br_bb >> 63) & 1) != 0)
+                & ((occ_bb & BK_EMPTY) == 0) & ((ea_bb & BK_SAFE) == 0)
+            )
+            bq_ok = (
+                side_black & cr_bq
+                & (((bk_bb >> 60) & 1) != 0) & (((br_bb >> 56) & 1) != 0)
+                & ((occ_bb & BQ_EMPTY) == 0) & ((ea_bb & BQ_SAFE) == 0)
+            )
+
+            ep_valid = ep >= 0
+            ep_unsafe_per_from = tl.zeros([BLOCK_SQ], tl.int32)
+            if ep_valid:
+                ep_cap_sq = tl.where(is_white_mover, ep - 8, ep + 8)
+                ep_cap_rank = ep_cap_sq >> 3
+                king_on_eprank = king_rank == ep_cap_rank
+                enemy_rq_v = ((pieces == rook_code) | (pieces == queen_code)).to(tl.int32)
+                from_lane = tl.arange(0, BLOCK_SQ)[:, None]
+                sq_lane = tl.arange(0, BLOCK_SQ)[None, :]
+                rank_of_sq = (sq_lane >> 3).to(tl.int32)
+                file_of_sq_2d = (sq_lane & 7).to(tl.int32)
+                on_king_rank2 = rank_of_sq == king_rank
+                vacated2 = (sq_lane == from_lane) | (sq_lane == ep_cap_sq) | (sq_lane == king_sq)
+                occ2 = ((pieces[None, :] != 0) & on_king_rank2 & ~vacated2).to(tl.int32)
+                west_occ = occ2 & (file_of_sq_2d < king_file).to(tl.int32)
+                east_occ = occ2 & (file_of_sq_2d > king_file).to(tl.int32)
+                west_file_v = tl.where(west_occ > 0, file_of_sq_2d, -1)
+                west_first_file = tl.max(west_file_v, axis=1)
+                east_file_v = tl.where(east_occ > 0, file_of_sq_2d, 8)
+                east_first_file = tl.min(east_file_v, axis=1)
+                has_west = west_first_file >= 0
+                has_east = east_first_file < 8
+                west_sq = king_rank * 8 + tl.maximum(west_first_file, 0)
+                east_sq = king_rank * 8 + tl.minimum(east_first_file, 7)
+                west_enemy_rq = tl.gather(enemy_rq_v, west_sq, axis=0)
+                east_enemy_rq = tl.gather(enemy_rq_v, east_sq, axis=0)
+                ep_unsafe_per_from = (
+                    (((west_enemy_rq != 0) & has_west) | ((east_enemy_rq != 0) & has_east))
+                    & king_on_eprank
+                ).to(tl.int32)
+
+            # Per-from-sq common quantities for the chunk loop.
+            rows2d_chunk = tl.arange(0, BLOCK_SQ)[:, None]
+            forward_scalar = tl.where(is_white_mover, 8, -8)
+            inter_sq_1d = tl.minimum(tl.maximum(sq + forward_scalar, 0), 63)
+            # Use register gather instead of global load (pieces is in registers).
+            inter_piece_1d = tl.gather(pieces, inter_sq_1d, axis=0)
+            from_piece_b = pieces[:, None]
+            from_is_white_per = (from_piece_b >= 1) & (from_piece_b <= 6)
+            from_is_black_per = (from_piece_b >= 7) & (from_piece_b <= 12)
+            from_belongs_mover_per = tl.where(is_white_mover, from_is_white_per, from_is_black_per)
+            from_is_king_per = from_piece_b == own_king_code
+            pt_per = tl.where(from_is_black_per, from_piece_b - 6,
+                              tl.where(from_is_white_per, from_piece_b, 0))
+            is_pawn_per = pt_per == 1
+            pt_for_lookup = tl.where(from_belongs_mover_per, pt_per, 0)
+            rrank_from = (rows2d_chunk >> 3).to(tl.int32)
+            from_rank_mover = tl.where(is_white_mover, rrank_from, 7 - rrank_from)
+            mover_pawn_code = tl.where(is_white_mover, 1, 7)
+
+            pt_lookup_1d = pt_for_lookup.reshape([BLOCK_SQ])
+            plane_allowed_lo_per = tl.load(PLANE_ALLOWED_BB_ptr + pt_lookup_1d * 2 + 0)
+            plane_allowed_hi_per = tl.load(PLANE_ALLOWED_BB_ptr + pt_lookup_1d * 2 + 1)
+
+            side_b_idx = tl.where(is_white_mover, 0, 1)
+            on_board_base = side_b_idx * 64 * 2
+            sq_long = tl.arange(0, BLOCK_SQ)
+            on_board_lo_per = tl.load(ON_BOARD_BB_ptr + on_board_base + sq_long * 2 + 0)
+            on_board_hi_per = tl.load(ON_BOARD_BB_ptr + on_board_base + sq_long * 2 + 1)
+
+            pin_idx = tl.where(pin_df_per_from == 99, 8,
+                      tl.where((pin_df_per_from == 0)  & (pin_dr_per_from == 1),  0,
+                      tl.where((pin_df_per_from == 1)  & (pin_dr_per_from == 1),  1,
+                      tl.where((pin_df_per_from == 1)  & (pin_dr_per_from == 0),  2,
+                      tl.where((pin_df_per_from == 1)  & (pin_dr_per_from == -1), 3,
+                      tl.where((pin_df_per_from == 0)  & (pin_dr_per_from == -1), 4,
+                      tl.where((pin_df_per_from == -1) & (pin_dr_per_from == -1), 5,
+                      tl.where((pin_df_per_from == -1) & (pin_dr_per_from == 0),  6,
+                      tl.where((pin_df_per_from == -1) & (pin_dr_per_from == 1),  7,
+                                                                                  8)))))))))
+            pin_base = side_b_idx * 9 * 2
+            pin_movable_lo_per = tl.load(PIN_MOVABLE_BB_ptr + pin_base + pin_idx * 2 + 0)
+            pin_movable_hi_per = tl.load(PIN_MOVABLE_BB_ptr + pin_base + pin_idx * 2 + 1)
+
+            ep_unsafe_b = ep_unsafe_per_from[:, None]
+
+            side_off = tl.where(is_white_mover, 0, 64 * BLOCK_PL)
+            side_off_int8 = tl.where(is_white_mover, 0, 64 * BLOCK_PL)
+
+            # ===================================================================
+            # Phase 5+6+7: per-chunk mask + reservoir sample.
+            # ===================================================================
+            running_min = tl.full([], 2.0, tl.float32)
+            running_action = 0
+            for chunk_idx in tl.static_range(0, BLOCK_PL // BLOCK_PL_CHUNK):
+                plane_off = chunk_idx * BLOCK_PL_CHUNK
+                local_pl = tl.arange(0, BLOCK_PL_CHUNK)
+                local_pl_2d = local_pl[None, :]
+                local_pl_64 = local_pl.to(tl.int64)
+                cols2d = local_pl_2d + plane_off
+
+                if chunk_idx == 0:
+                    allowed_per = plane_allowed_lo_per
+                    onboard_per = on_board_lo_per
+                    pin_mov_per = pin_movable_lo_per
+                    bb_is_q   = BB_IS_Q_LO
+                    bb_is_u   = BB_IS_U_LO
+                    bb_castle = BB_IS_CASTLE_LO
+                    bb_push   = BB_PUSH_LO
+                    bb_cap    = BB_CAP_LO
+                    bb_push1  = BB_PUSH1_LO
+                    bb_push2  = BB_PUSH2_LO
+                    bb_uppush = BB_UNDERPROMO_PUSH_LO
+                    bb_pvalid = BB_PLANE_VALID_LO
+                else:
+                    allowed_per = plane_allowed_hi_per
+                    onboard_per = on_board_hi_per
+                    pin_mov_per = pin_movable_hi_per
+                    bb_is_q   = BB_IS_Q_HI
+                    bb_is_u   = BB_IS_U_HI
+                    bb_castle = BB_IS_CASTLE_HI
+                    bb_push   = BB_PUSH_HI
+                    bb_cap    = BB_CAP_HI
+                    bb_push1  = BB_PUSH1_HI
+                    bb_push2  = BB_PUSH2_HI
+                    bb_uppush = BB_UNDERPROMO_PUSH_HI
+                    bb_pvalid = BB_PLANE_VALID_HI
+
+                allowed_bool = ((allowed_per[:, None] >> local_pl_64[None, :]) & 1) != 0
+                on_board2d = ((onboard_per[:, None] >> local_pl_64[None, :]) & 1) != 0
+                pin_at_ft = ((pin_mov_per[:, None] >> local_pl_64[None, :]) & 1) != 0
+
+                is_q   = ((bb_is_q   >> local_pl_64) & 1) != 0
+                is_u   = ((bb_is_u   >> local_pl_64) & 1) != 0
+                is_castle_plane = ((bb_castle >> local_pl_64) & 1) != 0
+                push_planes = ((bb_push >> local_pl_64) & 1) != 0
+                cap_planes  = ((bb_cap  >> local_pl_64) & 1) != 0
+                is_push2 = ((bb_push2 >> local_pl_64) & 1) != 0
+                plane_valid_chunk = ((bb_pvalid >> local_pl_64) & 1) != 0
+
+                flat_idx2d = rows2d_chunk * BLOCK_PL + cols2d
+                real_to = tl.load(REAL_TO_TBL_ptr + side_off_int8 + flat_idx2d).to(tl.int32)
+                real_to_64 = real_to.to(tl.int64)
+
+                occ_at_to = ((occ_bb >> real_to_64) & 1) != 0
+                to_is_empty = ~occ_at_to
+                to_is_enemy = ((enemy_bb >> real_to_64) & 1) != 0
+
+                between_idx = side_off + rows2d_chunk * BLOCK_PL + cols2d
+                between_mask = tl.load(BETWEEN_BB_ptr + between_idx)
+                has_intermediate = (between_mask & occ_bb) != 0
+
+                base = (
+                    from_belongs_mover_per & allowed_bool & on_board2d
+                    & (to_is_empty | to_is_enemy)
+                )
+                base = base & ~(is_q[None, :] & has_intermediate)
+                base = base & ~(is_pawn_per & push_planes[None, :] & ~to_is_empty)
+                is_ep_target_cell = (ep >= 0) & (real_to == ep)
+                base = base & ~(is_pawn_per & cap_planes[None, :] & ~(to_is_enemy | is_ep_target_cell))
+
+                bad_push2_rank = is_pawn_per & is_push2[None, :] & (from_rank_mover != 1)
+                base = base & ~bad_push2_rank
+                inter_piece = inter_piece_1d[:, None] + tl.zeros([BLOCK_SQ, BLOCK_PL_CHUNK], tl.int32)
+                bad_push2_blocked = is_pawn_per & is_push2[None, :] & (inter_piece != 0)
+                base = base & ~bad_push2_blocked
+
+                to_rank_mover = tl.where(is_white_mover, real_to >> 3, 7 - (real_to >> 3))
+                bad_underpromo = is_pawn_per & is_u[None, :] & (to_rank_mover != 7) & on_board2d
+                base = base & ~bad_underpromo
+
+                base = base & ~(from_is_king_per & is_castle_plane[None, :])
+
+                ea_at_to = ((ea_bb  >> real_to_64) & 1) != 0
+                boc_at_to = ((boc_bb >> real_to_64) & 1) != 0
+                king_legal = ~ea_at_to
+                non_king_legal = (~double_check) & pin_at_ft & (~in_check | boc_at_to)
+                legal_flag = tl.where(from_is_king_per, king_legal, non_king_legal)
+                out_mask = base & legal_flag & plane_valid_chunk[None, :]
+
+                is_ce = (rows2d_chunk == 4) & (cols2d == PLANE_CE) & is_white_mover
+                is_cw = (rows2d_chunk == 4) & (cols2d == PLANE_CW) & is_white_mover
+                is_ce_b = (rows2d_chunk == 60) & (cols2d == PLANE_CE) & (~is_white_mover)
+                is_cw_b = (rows2d_chunk == 60) & (cols2d == PLANE_CW) & (~is_white_mover)
+                out_mask = out_mask | (is_ce & wk_ok)
+                out_mask = out_mask | (is_cw & wq_ok)
+                out_mask = out_mask | (is_ce_b & bk_ok)
+                out_mask = out_mask | (is_cw_b & bq_ok)
+
+                is_ep_move = (
+                    (out_mask != 0)
+                    & (real_to == ep) & (ep >= 0) & on_board2d
+                    & (from_piece_b == mover_pawn_code)
+                )
+                out_mask = out_mask & ~(is_ep_move & (ep_unsafe_b != 0))
+
+                # ----- Reservoir sample over this chunk's set cells -----
+                # tag = U[0,1) for legal cells, sentinel 2.0 for illegal.
+                # Distinct offsets per (pid, d, chunk_idx, sq, plane_local).
+                offsets2d = (base_off_ply
+                             + chunk_idx * (BLOCK_SQ * BLOCK_PL_CHUNK)
+                             + rows2d_chunk.to(tl.int64) * BLOCK_PL_CHUNK
+                             + local_pl_2d.to(tl.int64))
+                tag = tl.rand(seed_runtime, offsets2d)
+                sentinel_tile = tl.full([BLOCK_SQ, BLOCK_PL_CHUNK], 2.0, tl.float32)
+                tag = tl.where(out_mask, tag, sentinel_tile)
+
+                flat_tag = tag.reshape([BLOCK_SQ * BLOCK_PL_CHUNK])
+                chunk_min = tl.min(flat_tag)
+                # Argmin via masked-arange-min: pick the smallest flat index
+                # whose value equals chunk_min (deterministic tie-break).
+                idx_arr = tl.arange(0, BLOCK_SQ * BLOCK_PL_CHUNK)
+                match = tl.where(flat_tag == chunk_min, idx_arr, BLOCK_SQ * BLOCK_PL_CHUNK)
+                chunk_argmin = tl.min(match)
+                chunk_sq = chunk_argmin // BLOCK_PL_CHUNK
+                chunk_pl_local = chunk_argmin % BLOCK_PL_CHUNK
+                chunk_action = chunk_sq * NUM_PL + (chunk_pl_local + chunk_idx * BLOCK_PL_CHUNK)
+
+                improved = chunk_min < running_min
+                running_min = tl.where(improved, chunk_min, running_min)
+                running_action = tl.where(improved, chunk_action, running_action)
+
+            # ----- Terminal handling (after both chunks) -----
+            any_legal = running_min < 1.5
+            terminal_now = (~done) & (~any_legal)
+            # Mover loses iff in_check at terminal (checkmate); else stalemate=draw.
+            # Root-POV: if in_check and root != mover -> +1; in_check and root==mover -> -1.
+            mover_loses_pov = tl.where(root_player != side, 1.0, -1.0)
+            terminal_value = tl.where(in_check, mover_loses_pov, 0.0)
+            leaf_value = tl.where(terminal_now, terminal_value, leaf_value)
+            done = done | terminal_now
+
+            # ----- Capture root action at d == 0 -----
+            if d == 0:
+                root_action = running_action
+
+            # ----- Apply step (gated by done; safe action 0 falls through) -----
+            action = running_action
+            new_p, new_s, new_cr, new_ep_, new_hmc, new_fmn = _step_body(
+                pieces, side, cr, ep, hmc, fmn, action,
+                STEP_DF_ptr, STEP_DR_ptr, STEP_KIND_ptr, STEP_PROMO_ptr,
+                BLOCK_SQ=BLOCK_SQ, NUM_PLANES_C=NUM_PL,
+            )
+            pieces = tl.where(done, pieces, new_p)
+            side = tl.where(done, side, new_s)
+            cr = tl.where(done, cr, new_cr)
+            ep = tl.where(done, ep, new_ep_)
+            hmc = tl.where(done, hmc, new_hmc)
+            fmn = tl.where(done, fmn, new_fmn)
+
+        tl.store(root_action_ptr + pid, root_action.to(tl.int64))
+        tl.store(leaf_value_ptr + pid, leaf_value)
+
+
+def triton_rollout(
+    initial_vs: VState, depth: int, seed: int = 0
+) -> tuple[Tensor, Tensor]:
+    """Run a full random-rollout (`depth` plies) per env in one Triton kernel.
+
+    Per env: at each ply compute legal mask in registers, reservoir-sample one
+    uniform legal action, freeze on terminal (no-move). Captures the action
+    sampled at ply 0 as the "root action". leaf_value is +1/-1/0 from
+    root-player POV if a terminal was reached during the rollout, else 0
+    (matches the semantics of bench_mcts._run_vec_mcts).
+
+    Returns (root_action [B] int64, leaf_value [B] float32).
+    """
+    if not _HAS_TRITON:
+        raise RuntimeError("triton is not available")
+    if initial_vs.device.type != "cuda":
+        raise RuntimeError("triton_rollout requires CUDA tensors")
+
+    device = initial_vs.device
+    B = initial_vs.batch_size
+    tbls = _legal_tables_on(device)
+    df_t, dr_t, kd_t, pr_t = _tables_on(device)
+
+    pieces = initial_vs.pieces.contiguous()
+    side = initial_vs.side_to_move.contiguous()
+    cr = initial_vs.castling.contiguous()
+    ep = initial_vs.en_passant.contiguous()
+    hmc = initial_vs.halfmove_clock.contiguous()
+    fmn = initial_vs.fullmove_number.contiguous()
+
+    root_action = torch.zeros(B, dtype=torch.int64, device=device)
+    leaf_value = torch.zeros(B, dtype=torch.float32, device=device)
+
+    bb = tbls["bb_scalars"]
+    _rollout_kernel[(B,)](
+        pieces, side, cr, ep, hmc, fmn,
+        root_action, leaf_value,
+        tbls["df"], tbls["dr"], tbls["kind"],
+        tbls["ray_dir"], tbls["ray_dist"], tbls["promo"],
+        tbls["knight"], tbls["king"], tbls["wpawn"], tbls["bpawn"],
+        tbls["knight_bb"], tbls["king_bb"], tbls["wpawn_bb"], tbls["bpawn_bb"],
+        tbls["between_bb"],
+        tbls["plane_allowed_bb"], tbls["pin_movable_bb"], tbls["on_board_bb"],
+        tbls["real_to_tbl"],
+        df_t, dr_t, kd_t, pr_t,
+        depth, seed,
+        BB_IS_Q_LO=bb["is_q"][0], BB_IS_Q_HI=bb["is_q"][1],
+        BB_IS_U_LO=bb["is_u"][0], BB_IS_U_HI=bb["is_u"][1],
+        BB_IS_CASTLE_LO=bb["is_castle"][0], BB_IS_CASTLE_HI=bb["is_castle"][1],
+        BB_PUSH_LO=bb["push"][0], BB_PUSH_HI=bb["push"][1],
+        BB_CAP_LO=bb["cap"][0], BB_CAP_HI=bb["cap"][1],
+        BB_PUSH1_LO=bb["push1"][0], BB_PUSH1_HI=bb["push1"][1],
+        BB_PUSH2_LO=bb["push2"][0], BB_PUSH2_HI=bb["push2"][1],
+        BB_UNDERPROMO_PUSH_LO=bb["underpromo_push"][0],
+        BB_UNDERPROMO_PUSH_HI=bb["underpromo_push"][1],
+        BB_PLANE_VALID_LO=bb["plane_valid"][0],
+        BB_PLANE_VALID_HI=bb["plane_valid"][1],
+        BLOCK_SQ=64, BLOCK_PL=_PADDED_PLANES, BLOCK_PL_CHUNK=64,
+        NUM_PL=NUM_MOVE_PLANES,
+        num_warps=1,
+    )
+    return root_action, leaf_value
