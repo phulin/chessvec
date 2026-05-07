@@ -1674,14 +1674,18 @@ if _HAS_TRITON:
             # ===================================================================
             running_min = tl.full([], 2.0, tl.float32)
             running_action = 0
+            # 4 chunks of 32 planes (was 2 chunks of 64): halves every [64×N]
+            # tile in the chunk body, reducing live register pressure.
             for chunk_idx in tl.static_range(0, BLOCK_PL // BLOCK_PL_CHUNK):
                 plane_off = chunk_idx * BLOCK_PL_CHUNK
                 local_pl = tl.arange(0, BLOCK_PL_CHUNK)
                 local_pl_2d = local_pl[None, :]
-                local_pl_64 = local_pl.to(tl.int64)
+                # Sub-offset within LO/HI half: chunks 0,2 → 0; chunks 1,3 → 32.
+                sub_off = (chunk_idx % 2) * 32
+                shift_amt = local_pl.to(tl.int64) + sub_off
                 cols2d = local_pl_2d + plane_off
 
-                if chunk_idx == 0:
+                if chunk_idx < 2:
                     allowed_per = plane_allowed_lo_per
                     onboard_per = on_board_lo_per
                     pin_mov_per = pin_movable_lo_per
@@ -1708,17 +1712,17 @@ if _HAS_TRITON:
                     bb_uppush = BB_UNDERPROMO_PUSH_HI
                     bb_pvalid = BB_PLANE_VALID_HI
 
-                allowed_bool = ((allowed_per[:, None] >> local_pl_64[None, :]) & 1) != 0
-                on_board2d = ((onboard_per[:, None] >> local_pl_64[None, :]) & 1) != 0
-                pin_at_ft = ((pin_mov_per[:, None] >> local_pl_64[None, :]) & 1) != 0
+                allowed_bool = ((allowed_per[:, None] >> shift_amt[None, :]) & 1) != 0
+                on_board2d = ((onboard_per[:, None] >> shift_amt[None, :]) & 1) != 0
+                pin_at_ft = ((pin_mov_per[:, None] >> shift_amt[None, :]) & 1) != 0
 
-                is_q   = ((bb_is_q   >> local_pl_64) & 1) != 0
-                is_u   = ((bb_is_u   >> local_pl_64) & 1) != 0
-                is_castle_plane = ((bb_castle >> local_pl_64) & 1) != 0
-                push_planes = ((bb_push >> local_pl_64) & 1) != 0
-                cap_planes  = ((bb_cap  >> local_pl_64) & 1) != 0
-                is_push2 = ((bb_push2 >> local_pl_64) & 1) != 0
-                plane_valid_chunk = ((bb_pvalid >> local_pl_64) & 1) != 0
+                is_q   = ((bb_is_q   >> shift_amt) & 1) != 0
+                is_u   = ((bb_is_u   >> shift_amt) & 1) != 0
+                is_castle_plane = ((bb_castle >> shift_amt) & 1) != 0
+                push_planes = ((bb_push >> shift_amt) & 1) != 0
+                cap_planes  = ((bb_cap  >> shift_amt) & 1) != 0
+                is_push2 = ((bb_push2 >> shift_amt) & 1) != 0
+                plane_valid_chunk = ((bb_pvalid >> shift_amt) & 1) != 0
 
                 flat_idx2d = rows2d_chunk * BLOCK_PL + cols2d
                 real_to = tl.load(REAL_TO_TBL_ptr + side_off_int8 + flat_idx2d).to(tl.int32)
@@ -1891,7 +1895,7 @@ def triton_rollout(
         BB_UNDERPROMO_PUSH_HI=bb["underpromo_push"][1],
         BB_PLANE_VALID_LO=bb["plane_valid"][0],
         BB_PLANE_VALID_HI=bb["plane_valid"][1],
-        BLOCK_SQ=64, BLOCK_PL=_PADDED_PLANES, BLOCK_PL_CHUNK=64,
+        BLOCK_SQ=64, BLOCK_PL=_PADDED_PLANES, BLOCK_PL_CHUNK=32,
         NUM_PL=NUM_MOVE_PLANES,
         num_warps=2,
     )
