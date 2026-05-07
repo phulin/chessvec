@@ -465,6 +465,23 @@ def _legal_tables_on(device: torch.device) -> dict[str, Tensor]:
     wpawn_tbl = _WPAWN_ATTACK.to(device=device, dtype=torch.int32).contiguous()
     bpawn_tbl = _BPAWN_ATTACK.to(device=device, dtype=torch.int32).contiguous()
 
+    # Per-source-square u64 attack bitboards (idea #1). For each [64,64] bool
+    # table, pack each row into a u64 stored as signed int64 (matching torch).
+    def _table_to_bb(tbl: Tensor) -> Tensor:
+        out = torch.zeros(64, dtype=torch.int64)
+        for s in range(64):
+            v = 0
+            for t in range(64):
+                if bool(tbl[s, t]):
+                    v |= 1 << t
+            out[s] = v if v < (1 << 63) else v - (1 << 64)
+        return out
+
+    knight_bb = _table_to_bb(_KNIGHT_TABLE).to(device=device).contiguous()
+    king_bb = _table_to_bb(_KING_TABLE).to(device=device).contiguous()
+    wpawn_bb = _table_to_bb(_WPAWN_ATTACK).to(device=device).contiguous()
+    bpawn_bb = _table_to_bb(_BPAWN_ATTACK).to(device=device).contiguous()
+
     # Helper: convert a Python int holding a 64-bit pattern into a signed int
     # with the same bit pattern (since torch.int64 can't directly hold values
     # >= 2**63). Used to build bitboard tables.
@@ -653,6 +670,10 @@ def _legal_tables_on(device: torch.device) -> dict[str, Tensor]:
         "king": king_tbl,
         "wpawn": wpawn_tbl,
         "bpawn": bpawn_tbl,
+        "knight_bb": knight_bb,
+        "king_bb": king_bb,
+        "wpawn_bb": wpawn_bb,
+        "bpawn_bb": bpawn_bb,
         "between_bb": between_bb,
         "plane_allowed_bb": plane_allowed_bb,
         "pin_movable_bb": pin_movable_bb,
@@ -683,6 +704,10 @@ if _HAS_TRITON:
         KING_TBL_ptr,
         WPAWN_TBL_ptr,
         BPAWN_TBL_ptr,
+        KNIGHT_BB_ptr,     # int64 [64]  per-square attack bitboard
+        KING_BB_ptr,
+        WPAWN_BB_ptr,
+        BPAWN_BB_ptr,
         BETWEEN_BB_ptr,    # int64 [2, 64, PAD]  (white, black)
         PLANE_ALLOWED_BB_ptr,  # int64 [7, 2]   per piece-type
         PIN_MOVABLE_BB_ptr,    # int64 [2, 9, 2] per side per pin-state
@@ -729,28 +754,36 @@ if _HAS_TRITON:
         enemy_king_code = tl.where(is_white_mover, 12, 6)
         own_king_code = tl.where(is_white_mover, 6, 12)
 
-        rows = tl.arange(0, BLOCK_SQ)[:, None]
-        cols = tl.arange(0, BLOCK_SQ)[None, :]
-        KNIGHT_TBL = tl.load(KNIGHT_TBL_ptr + rows * 64 + cols).to(tl.int32)
-        KING_TBL = tl.load(KING_TBL_ptr + rows * 64 + cols).to(tl.int32)
-        WP_TBL = tl.load(WPAWN_TBL_ptr + rows * 64 + cols).to(tl.int32)
-        BP_TBL = tl.load(BPAWN_TBL_ptr + rows * 64 + cols).to(tl.int32)
-        # Mover white -> enemy black -> use BPAWN attacks (squares attacked BY black pawns).
-        PAWN_TBL = tl.where(is_white_mover, BP_TBL, WP_TBL)
+        # Idea #1: per-source-square u64 attack bitboards. The matmul becomes
+        # an OR-reduction over masked rows.
+        KNIGHT_BB = tl.load(KNIGHT_BB_ptr + sq)         # [64] int64
+        KING_BB = tl.load(KING_BB_ptr + sq)
+        WP_BB = tl.load(WPAWN_BB_ptr + sq)
+        BP_BB = tl.load(BPAWN_BB_ptr + sq)
+        PAWN_BB = tl.where(is_white_mover, BP_BB, WP_BB)
 
-        enemy_pawn = (pieces_nk == pawn_code).to(tl.int32)
-        enemy_knight = (pieces_nk == knight_code).to(tl.int32)
-        enemy_king = (pieces_nk == enemy_king_code).to(tl.int32)
+        enemy_pawn_v = pieces_nk == pawn_code
+        enemy_knight_v = pieces_nk == knight_code
+        enemy_king_v = pieces_nk == enemy_king_code
 
-        knight_atk = (tl.sum(enemy_knight[:, None] * KNIGHT_TBL, axis=0) > 0).to(tl.int32)
-        king_atk = (tl.sum(enemy_king[:, None] * KING_TBL, axis=0) > 0).to(tl.int32)
-        pawn_atk = (tl.sum(enemy_pawn[:, None] * PAWN_TBL, axis=0) > 0).to(tl.int32)
+        zero64 = tl.zeros([BLOCK_SQ], tl.int64)
+        knight_atk_bb = tl.reduce_or(
+            tl.where(enemy_knight_v, KNIGHT_BB, zero64), axis=0
+        )
+        king_atk_bb = tl.reduce_or(
+            tl.where(enemy_king_v, KING_BB, zero64), axis=0
+        )
+        pawn_atk_bb = tl.reduce_or(
+            tl.where(enemy_pawn_v, PAWN_BB, zero64), axis=0
+        )
+
+        # Keep these int32 [64] forms for the silenced-unused-vars block below.
+        enemy_pawn = enemy_pawn_v.to(tl.int32)
+        enemy_knight = enemy_knight_v.to(tl.int32)
+        enemy_king = enemy_king_v.to(tl.int32)
 
         file_sq = sq & 7
         rank_sq = sq >> 3
-        is_orth_slider = ((pieces_nk == rook_code) | (pieces_nk == queen_code)).to(tl.int32)
-        is_diag_slider = ((pieces_nk == bishop_code) | (pieces_nk == queen_code)).to(tl.int32)
-        _ = is_orth_slider + is_diag_slider  # silence unused
 
         slider_atk = tl.zeros([BLOCK_SQ], tl.int32)
         DFS_C = [0, 1, 1, 1, 0, -1, -1, -1]
@@ -786,10 +819,10 @@ if _HAS_TRITON:
             contrib = (contrib > 0).to(tl.int32)
             slider_atk = slider_atk | contrib
 
-        enemy_attacks = (knight_atk | king_atk | pawn_atk | slider_atk)  # [64] int32 0/1
-        # Pack into a u64 bitboard (scalar). bit_per_sq used here and later.
+        # Pack slider [64] int32 vector into u64; combine with already-bb jump attacks.
         bit_per_sq = (tl.full([1], 1, tl.int64) << sq.to(tl.int64)).to(tl.int64)
-        ea_bb = tl.sum(tl.where(enemy_attacks != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+        slider_atk_bb = tl.sum(tl.where(slider_atk != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+        ea_bb = knight_atk_bb | king_atk_bb | pawn_atk_bb | slider_atk_bb
 
         # ----- Phase 3: ray analysis from king -----
         # For each direction d in 0..7, walk 7 steps from king. Track first/second
@@ -803,147 +836,90 @@ if _HAS_TRITON:
         # savings.  pin_df_per_from[from] in {-1, 0, +1, 99}; same for pin_dr.
         pin_df_per_from = tl.full([BLOCK_SQ], 99, tl.int32)
         pin_dr_per_from = tl.full([BLOCK_SQ], 99, tl.int32)
-        block_or_capture = tl.zeros([BLOCK_SQ], tl.int32)
+        boc_bb = tl.zeros([], tl.int64)
         num_checkers_slider = 0
 
-        # Pre-compute "is_orth direction" array as static (we'll inline via cond).
+        # Idea #5: vectorize the per-direction 7-step ray walk as an [8] tile.
+        # Replaces 56 sequential scalar steps with 8 parallel gathers.
+        step8 = tl.arange(0, 8)                        # [8]
+        one64_8 = tl.full([8], 1, tl.int64)
         for d_idx in tl.static_range(0, 8):
             df_d = DFS_C[d_idx]
             dr_d = DRS_C[d_idx]
             is_orth = ORTH_C[d_idx]
 
-            # Walk 7 steps. Record first and second occupied square + values.
-            first_step = -1
-            second_step = -1
-            first_sq = 0
-            second_sq = 0
-            first_p = 0
-            second_p = 0
-            # Need to track ray squares to build block_or_capture/pin_ray masks.
-            # Store ray_sq and ray_piece per step in registers (7 each).
-            rs_0 = 0; rs_1 = 0; rs_2 = 0; rs_3 = 0; rs_4 = 0; rs_5 = 0; rs_6 = 0
-            on_0 = 0; on_1 = 0; on_2 = 0; on_3 = 0; on_4 = 0; on_5 = 0; on_6 = 0
+            tf = king_file + df_d * step8              # [8]
+            tr = king_rank + dr_d * step8              # [8]
+            on_b = ((tf >= 0) & (tf < 8) & (tr >= 0) & (tr < 8) & (step8 >= 1))
+            tsq = tl.where(on_b, tr * 8 + tf, 0)       # [8]
+            tp = tl.gather(pieces, tsq, axis=0)        # [8] int32
+            tp = tl.where(on_b, tp, 0)
+            is_piece = tp != 0
+            cum = tl.cumsum(is_piece.to(tl.int32), axis=0)   # [8]
+            first_mask = (cum == 1) & is_piece
+            second_mask = (cum == 2) & is_piece
+            first_p = tl.sum(tl.where(first_mask, tp, 0))
+            first_sq = tl.sum(tl.where(first_mask, tsq, 0))
+            second_p = tl.sum(tl.where(second_mask, tp, 0))
+            has_first = tl.sum(first_mask.to(tl.int32)) > 0
+            has_second = tl.sum(second_mask.to(tl.int32)) > 0
 
-            for step in tl.static_range(1, 8):
-                tf = king_file + df_d * step
-                tr = king_rank + dr_d * step
-                on_b = ((tf >= 0) & (tf < 8) & (tr >= 0) & (tr < 8))
-                tsq = tl.where(on_b, tr * 8 + tf, 0)
-                # Use pieces (king kept) for blocker test from from-sq side, but for
-                # king-ray analysis we use pieces (king kept too — but king is
-                # the start). We use pieces (with king removed for the king's own
-                # square only).
-                # Load piece at tsq via gather over `pieces`.
-                tp = tl.load(pieces_ptr + pid * BLOCK_SQ + tsq).to(tl.int32)
-                # Cast on_b to scalar int by sum trick: it's already scalar here
-                # because tf/tr are scalar (king_file/king_rank are scalars).
-                tp = tl.where(on_b, tp, 0)
-
-                is_piece = tp != 0
-                # First-piece detection.
-                is_first = is_piece & (first_step == -1)
-                first_step = tl.where(is_first, step - 1, first_step)
-                first_sq = tl.where(is_first, tsq, first_sq)
-                first_p = tl.where(is_first, tp, first_p)
-                # Second-piece detection (must come strictly after first).
-                is_second = is_piece & (first_step != -1) & (step - 1 > first_step) & (second_step == -1)
-                second_step = tl.where(is_second, step - 1, second_step)
-                second_sq = tl.where(is_second, tsq, second_sq)
-                second_p = tl.where(is_second, tp, second_p)
-
-                # Stash ray sq + on_b.
-                if step == 1:
-                    rs_0 = tsq; on_0 = tl.where(on_b, 1, 0)
-                if step == 2:
-                    rs_1 = tsq; on_1 = tl.where(on_b, 1, 0)
-                if step == 3:
-                    rs_2 = tsq; on_2 = tl.where(on_b, 1, 0)
-                if step == 4:
-                    rs_3 = tsq; on_3 = tl.where(on_b, 1, 0)
-                if step == 5:
-                    rs_4 = tsq; on_4 = tl.where(on_b, 1, 0)
-                if step == 6:
-                    rs_5 = tsq; on_5 = tl.where(on_b, 1, 0)
-                if step == 7:
-                    rs_6 = tsq; on_6 = tl.where(on_b, 1, 0)
-
-            # Classify first/second pieces.
             first_is_white = (first_p >= 1) & (first_p <= 6)
             first_is_black = (first_p >= 7) & (first_p <= 12)
             first_is_own = tl.where(is_white_mover, first_is_white, first_is_black)
             first_is_enemy = tl.where(is_white_mover, first_is_black, first_is_white)
+            second_is_white = (second_p >= 1) & (second_p <= 6)
+            second_is_black = (second_p >= 7) & (second_p <= 12)
+            second_is_enemy = tl.where(is_white_mover, second_is_black, second_is_white)
 
             if is_orth:
                 first_is_enemy_slider = first_is_enemy & ((first_p == rook_code) | (first_p == queen_code))
-                second_is_enemy_slider = (
-                    ((second_p >= 1) & (second_p <= 12))
-                    & (tl.where(is_white_mover,
-                                (second_p >= 7) & (second_p <= 12),
-                                (second_p >= 1) & (second_p <= 6)))
-                    & ((second_p == rook_code) | (second_p == queen_code))
-                )
+                second_is_enemy_slider = second_is_enemy & ((second_p == rook_code) | (second_p == queen_code))
             else:
                 first_is_enemy_slider = first_is_enemy & ((first_p == bishop_code) | (first_p == queen_code))
-                second_is_enemy_slider = (
-                    ((second_p >= 1) & (second_p <= 12))
-                    & (tl.where(is_white_mover,
-                                (second_p >= 7) & (second_p <= 12),
-                                (second_p >= 1) & (second_p <= 6)))
-                    & ((second_p == bishop_code) | (second_p == queen_code))
-                )
+                second_is_enemy_slider = second_is_enemy & ((second_p == bishop_code) | (second_p == queen_code))
 
-            is_check_ray = first_is_enemy_slider & (first_step != -1)
-            is_pin_ray = first_is_own & second_is_enemy_slider & (second_step != -1)
+            is_check_ray = first_is_enemy_slider & has_first
+            is_pin_ray = first_is_own & second_is_enemy_slider & has_second
             num_checkers_slider = num_checkers_slider + tl.where(is_check_ray, 1, 0)
 
-            # Build block_or_capture additions: squares 1..first_step+1 along ray
-            # if check_ray. We have step indices 0..6; in_segment[k] = (k <= first_step).
-            # Add (sq == ray_sq[k]) for k where in_segment.
-            # When not check_ray, contribute nothing.
-            for k in tl.static_range(0, 7):
-                rsq_k = 0
-                onb_k = 0
-                if k == 0: rsq_k = rs_0; onb_k = on_0
-                if k == 1: rsq_k = rs_1; onb_k = on_1
-                if k == 2: rsq_k = rs_2; onb_k = on_2
-                if k == 3: rsq_k = rs_3; onb_k = on_3
-                if k == 4: rsq_k = rs_4; onb_k = on_4
-                if k == 5: rsq_k = rs_5; onb_k = on_5
-                if k == 6: rsq_k = rs_6; onb_k = on_6
-                in_seg_check = (k <= first_step) & is_check_ray & (onb_k > 0)
-                add_check = tl.where(in_seg_check & (sq == rsq_k), 1, 0)
-                block_or_capture = block_or_capture | add_check
+            # block_or_capture for this dir: squares with cum<=1 & on_b (path
+            # to and including the first piece). Pack directly to a u64.
+            in_seg = (cum <= 1) & on_b
+            ray_bb = tl.sum(tl.where(in_seg, one64_8 << tsq.to(tl.int64), tl.zeros([8], tl.int64)))
+            boc_bb = boc_bb | tl.where(is_check_ray, ray_bb, tl.zeros([], tl.int64))
 
-            # Pin direction (compact). For each direction d that is a pin ray,
-            # write sign(df_d), sign(dr_d) into the row at first_sq.
             df_unit_d = (1 if df_d > 0 else (-1 if df_d < 0 else 0))
             dr_unit_d = (1 if dr_d > 0 else (-1 if dr_d < 0 else 0))
             pin_match_lane = (sq == first_sq) & is_pin_ray
             pin_df_per_from = tl.where(pin_match_lane, df_unit_d, pin_df_per_from)
             pin_dr_per_from = tl.where(pin_match_lane, dr_unit_d, pin_dr_per_from)
 
-        # Knight + pawn checkers (single-square contributions to block_or_capture).
-        # knight_attacks_king[sq] = KNIGHT_TBL[king_sq, sq] (symmetric).
-        knight_row_idx = king_sq * 64 + sq
-        knight_attacks_king = tl.load(KNIGHT_TBL_ptr + knight_row_idx).to(tl.int32)
-        enemy_knight_at = (pieces == knight_code).to(tl.int32)
-        knight_checkers = knight_attacks_king * enemy_knight_at
+        # Knight + pawn checkers (single-square contributions to boc_bb).
+        # By knight-attack symmetry, KNIGHT_BB[king_sq] = squares attacking the
+        # king. Same trick for pawn attacks: a black pawn attacks `s` to king_sq
+        # iff a white pawn on king_sq would attack `s`, so WPAWN_BB[king_sq]
+        # gives the squares from which an enemy black pawn checks the king.
+        knight_atks_to_king_bb = tl.load(KNIGHT_BB_ptr + king_sq)
+        wp_at_king_bb = tl.load(WPAWN_BB_ptr + king_sq)
+        bp_at_king_bb = tl.load(BPAWN_BB_ptr + king_sq)
+        pawn_atks_to_king_bb = tl.where(is_white_mover, wp_at_king_bb, bp_at_king_bb)
+        enemy_knight_bb = tl.sum(
+            tl.where(pieces == knight_code, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64))
+        )
+        enemy_pawn_bb = tl.sum(
+            tl.where(pieces == pawn_code, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64))
+        )
+        knight_check_bb = knight_atks_to_king_bb & enemy_knight_bb
+        pawn_check_bb = pawn_atks_to_king_bb & enemy_pawn_bb
+        # Per-lane vectors are still needed only for num_checkers counts.
+        knight_checkers = (((knight_atks_to_king_bb >> sq.to(tl.int64)) & 1)
+                           & (pieces == knight_code).to(tl.int64)).to(tl.int32)
+        pawn_checkers = (((pawn_atks_to_king_bb >> sq.to(tl.int64)) & 1)
+                         & (pieces == pawn_code).to(tl.int64)).to(tl.int32)
 
-        # Pawn attackers TO king sq: use the source table — row king_sq of the
-        # transposed table = WPAWN_ATTACK[:, king_sq] when enemy is white.
-        # We don't have transposed table loaded; compute inline as TBL[sq, king_sq].
-        # Mover white -> enemy black -> source pawns are black pawns -> use BPAWN_ATTACK[sq, king_sq].
-        if True:  # always executed; conditional below
-            pass
-        pawn_src_idx = sq * 64 + king_sq
-        bp_atk_to_king = tl.load(BPAWN_TBL_ptr + pawn_src_idx).to(tl.int32)
-        wp_atk_to_king = tl.load(WPAWN_TBL_ptr + pawn_src_idx).to(tl.int32)
-        pawn_atk_to_king = tl.where(is_white_mover, bp_atk_to_king, wp_atk_to_king)
-        enemy_pawn_at = (pieces == pawn_code).to(tl.int32)
-        pawn_checkers = pawn_atk_to_king * enemy_pawn_at
-
-        block_or_capture = block_or_capture | knight_checkers | pawn_checkers
-        boc_bb = tl.sum(tl.where(block_or_capture != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+        # OR knight/pawn check contributions into boc_bb (already in u64 form).
+        boc_bb = boc_bb | knight_check_bb | pawn_check_bb
         num_checkers = (
             num_checkers_slider
             + tl.sum(knight_checkers)
@@ -955,6 +931,14 @@ if _HAS_TRITON:
         # ----- Phase 4b: per-board scalar prep for castling and EP-pin -----
         # Hoist occ_bb here so it's available for both castling and EP scans.
         occ_bb = tl.sum(tl.where(pieces != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
+        # Enemy occupancy bitboard — used in the per-cell phase to test
+        # `to_is_enemy` via a scalar bb shift instead of a [64,64] gather.
+        is_enemy_v = tl.where(
+            is_white_mover,
+            (pieces >= 7) & (pieces <= 12),
+            (pieces >= 1) & (pieces <= 6),
+        )
+        enemy_bb = tl.sum(tl.where(is_enemy_v, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64)))
 
         # Castling check via bitboards. Constant masks for each of 4 castle rights:
         #   *_EMPTY: squares that must be empty (between king and rook).
@@ -1012,34 +996,37 @@ if _HAS_TRITON:
         e8, f8c, g8c, d8c, c8c, b8c, a8c, h8c = 60, 61, 62, 59, 58, 57, 56, 63
 
         # ---- EP horizontal-pin: per-from ep_unsafe[64] (state-dependent) ----
+        # Idea #4: skip the [64,64] h-rank tile entirely when ep < 0.
         ep_valid = ep >= 0
-        ep_cap_sq = tl.where(is_white_mover, ep - 8, ep + 8)
-        ep_cap_rank = ep_cap_sq >> 3
-        king_on_eprank = (king_rank == ep_cap_rank) & ep_valid
-        enemy_rq_v = ((pieces == rook_code) | (pieces == queen_code)).to(tl.int32)
-        from_lane = tl.arange(0, BLOCK_SQ)[:, None]
-        sq_lane = tl.arange(0, BLOCK_SQ)[None, :]
-        rank_of_sq = (sq_lane >> 3).to(tl.int32)
-        file_of_sq_2d = (sq_lane & 7).to(tl.int32)
-        on_king_rank2 = rank_of_sq == king_rank
-        vacated2 = (sq_lane == from_lane) | (sq_lane == ep_cap_sq) | (sq_lane == king_sq)
-        occ2 = ((pieces[None, :] != 0) & on_king_rank2 & ~vacated2).to(tl.int32)
-        west_occ = occ2 & (file_of_sq_2d < king_file).to(tl.int32)
-        east_occ = occ2 & (file_of_sq_2d > king_file).to(tl.int32)
-        west_file_v = tl.where(west_occ > 0, file_of_sq_2d, -1)
-        west_first_file = tl.max(west_file_v, axis=1)
-        east_file_v = tl.where(east_occ > 0, file_of_sq_2d, 8)
-        east_first_file = tl.min(east_file_v, axis=1)
-        has_west = west_first_file >= 0
-        has_east = east_first_file < 8
-        west_sq = king_rank * 8 + tl.maximum(west_first_file, 0)
-        east_sq = king_rank * 8 + tl.minimum(east_first_file, 7)
-        west_enemy_rq = tl.gather(enemy_rq_v, west_sq, axis=0)
-        east_enemy_rq = tl.gather(enemy_rq_v, east_sq, axis=0)
-        ep_unsafe_per_from = (
-            (((west_enemy_rq != 0) & has_west) | ((east_enemy_rq != 0) & has_east))
-            & king_on_eprank
-        ).to(tl.int32)
+        ep_unsafe_per_from = tl.zeros([BLOCK_SQ], tl.int32)
+        if ep_valid:
+            ep_cap_sq = tl.where(is_white_mover, ep - 8, ep + 8)
+            ep_cap_rank = ep_cap_sq >> 3
+            king_on_eprank = king_rank == ep_cap_rank
+            enemy_rq_v = ((pieces == rook_code) | (pieces == queen_code)).to(tl.int32)
+            from_lane = tl.arange(0, BLOCK_SQ)[:, None]
+            sq_lane = tl.arange(0, BLOCK_SQ)[None, :]
+            rank_of_sq = (sq_lane >> 3).to(tl.int32)
+            file_of_sq_2d = (sq_lane & 7).to(tl.int32)
+            on_king_rank2 = rank_of_sq == king_rank
+            vacated2 = (sq_lane == from_lane) | (sq_lane == ep_cap_sq) | (sq_lane == king_sq)
+            occ2 = ((pieces[None, :] != 0) & on_king_rank2 & ~vacated2).to(tl.int32)
+            west_occ = occ2 & (file_of_sq_2d < king_file).to(tl.int32)
+            east_occ = occ2 & (file_of_sq_2d > king_file).to(tl.int32)
+            west_file_v = tl.where(west_occ > 0, file_of_sq_2d, -1)
+            west_first_file = tl.max(west_file_v, axis=1)
+            east_file_v = tl.where(east_occ > 0, file_of_sq_2d, 8)
+            east_first_file = tl.min(east_file_v, axis=1)
+            has_west = west_first_file >= 0
+            has_east = east_first_file < 8
+            west_sq = king_rank * 8 + tl.maximum(west_first_file, 0)
+            east_sq = king_rank * 8 + tl.minimum(east_first_file, 7)
+            west_enemy_rq = tl.gather(enemy_rq_v, west_sq, axis=0)
+            east_enemy_rq = tl.gather(enemy_rq_v, east_sq, axis=0)
+            ep_unsafe_per_from = (
+                (((west_enemy_rq != 0) & has_west) | ((east_enemy_rq != 0) & has_east))
+                & king_on_eprank
+            ).to(tl.int32)
 
         # Common per-from-sq quantities for the chunk loop.
         rows2d_chunk = tl.arange(0, BLOCK_SQ)[:, None]
@@ -1154,16 +1141,13 @@ if _HAS_TRITON:
             real_to = tl.load(REAL_TO_TBL_ptr + side_off_int8 + flat_idx).to(tl.int32)
             real_to_64 = real_to.to(tl.int64)
 
-            # to-sq piece (gather from pieces).
-            to_piece = tl.gather(
-                pieces, real_to.reshape([BLOCK_SQ * BLOCK_PL_CHUNK]), axis=0
-            ).reshape([BLOCK_SQ, BLOCK_PL_CHUNK])
-            to_piece = tl.where(on_board2d, to_piece, 0)
-
-            to_is_white = (to_piece >= 1) & (to_piece <= 6)
-            to_is_black = (to_piece >= 7) & (to_piece <= 12)
-            to_is_empty = to_piece == 0
-            to_is_enemy = tl.where(is_white_mover, to_is_black, to_is_white)
+            # to_is_enemy / to_is_empty via scalar bb shifts instead of a
+            # [64,64] gather over `pieces`.
+            occ_at_to = ((occ_bb >> real_to_64) & 1) != 0
+            to_is_empty = ~occ_at_to                       # off-board lanes are
+            # gated by `on_board2d` later, so the off-board interpretation
+            # doesn't matter.
+            to_is_enemy = ((enemy_bb >> real_to_64) & 1) != 0
 
             # Slider intermediate-blocker test (precomputed bitboards).
             between_idx = side_off + rows2d_chunk * BLOCK_PL + cols2d
@@ -1251,7 +1235,9 @@ def triton_legal_action_mask(vs: VState) -> Tensor:
     _legal_mask_kernel[(B,)](
         pieces, side, cr, ep, out,
         tbls["df"], tbls["dr"], tbls["kind"], tbls["ray_dir"], tbls["ray_dist"], tbls["promo"],
-        tbls["knight"], tbls["king"], tbls["wpawn"], tbls["bpawn"], tbls["between_bb"],
+        tbls["knight"], tbls["king"], tbls["wpawn"], tbls["bpawn"],
+        tbls["knight_bb"], tbls["king_bb"], tbls["wpawn_bb"], tbls["bpawn_bb"],
+        tbls["between_bb"],
         tbls["plane_allowed_bb"], tbls["pin_movable_bb"], tbls["on_board_bb"],
         tbls["real_to_tbl"],
         BB_IS_Q_LO=bb["is_q"][0], BB_IS_Q_HI=bb["is_q"][1],
