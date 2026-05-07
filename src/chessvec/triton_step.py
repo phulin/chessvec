@@ -1366,6 +1366,9 @@ if _HAS_TRITON:
         # offsets_per_ply = 2 chunks * 64 sq * 64 plane = 8192
         OFF_PER_PLY = 8192
 
+        # bit_per_sq[i] = 1 << i; pure function of sq, hoist out of depth loop.
+        bit_per_sq = (tl.full([1], 1, tl.int64) << sq.to(tl.int64)).to(tl.int64)
+
         for d in range(depth_runtime):
             base_off_ply = (pid.to(tl.int64) * (depth_runtime * OFF_PER_PLY)
                             + d.to(tl.int64) * OFF_PER_PLY)
@@ -1444,7 +1447,6 @@ if _HAS_TRITON:
                 contrib = (contrib > 0).to(tl.int32)
                 slider_atk = slider_atk | contrib
 
-            bit_per_sq = (tl.full([1], 1, tl.int64) << sq.to(tl.int64)).to(tl.int64)
             slider_atk_bb = tl.sum(
                 tl.where(slider_atk != 0, bit_per_sq, tl.zeros([BLOCK_SQ], tl.int64))
             )
@@ -1787,9 +1789,7 @@ if _HAS_TRITON:
                              + chunk_idx * (BLOCK_SQ * BLOCK_PL_CHUNK)
                              + rows2d_chunk.to(tl.int64) * BLOCK_PL_CHUNK
                              + local_pl_2d.to(tl.int64))
-                tag = tl.rand(seed_runtime, offsets2d)
-                sentinel_tile = tl.full([BLOCK_SQ, BLOCK_PL_CHUNK], 2.0, tl.float32)
-                tag = tl.where(out_mask, tag, sentinel_tile)
+                tag = tl.where(out_mask, tl.rand(seed_runtime, offsets2d), 2.0)
 
                 flat_tag = tag.reshape([BLOCK_SQ * BLOCK_PL_CHUNK])
                 chunk_min = tl.min(flat_tag)
